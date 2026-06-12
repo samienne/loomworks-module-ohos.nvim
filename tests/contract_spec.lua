@@ -23,6 +23,16 @@ describe("harmony module table — required fields", function()
         assert.equals("harmony", harmony.id)
     end)
 
+    it("api_version matches loomworks core's MODULE version", function()
+        local API = require("loomworks.api_versions")
+        assert.equals(API.module, harmony.api_version,
+            "harmony declares api_version=" .. tostring(harmony.api_version)
+                .. " but loomworks core expects " .. tostring(API.module)
+                .. ". If core's API.module bumped, update harmony's "
+                .. "declaration and adapt to the new contract; "
+                .. "loomworks.modules.get() refuses to load on mismatch.")
+    end)
+
     it("declares M.languages as a non-empty string array", function()
         assert.is_table(harmony.languages)
         assert.is_true(#harmony.languages > 0,

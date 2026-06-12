@@ -7,6 +7,7 @@ local SDK = require("loomworks.sdk")
 
 local P = {}
 P.id = "ohos"
+P.api_version = 1
 P.display_name = "DevEco Studio"
 
 local uv = vim.uv or vim.loop

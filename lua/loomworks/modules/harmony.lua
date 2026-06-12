@@ -1,6 +1,7 @@
 local M = {}
 
 M.id = "harmony"
+M.api_version = 1
 M.has_keyed_tools = false
 M.has_options = false
 M.has_devices = true
