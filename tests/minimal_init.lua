@@ -44,6 +44,12 @@ end
 local loomworks_path = find_loomworks()
 if loomworks_path then
     vim.opt.rtp:prepend(loomworks_path)
+    -- Plenary's busted runner doesn't extend package.path from rtp,
+    -- so require("loomworks.modules") inside a spec only works if
+    -- the path is on package.path explicitly. Belt-and-braces over
+    -- nvim's rtp-aware loader.
+    package.path = loomworks_path .. "/lua/?.lua;"
+        .. loomworks_path .. "/lua/?/init.lua;" .. package.path
 else
     error("loomworks-module-ohos: cannot find loomworks.nvim — "
         .. "set $LOOMWORKS_PATH or check it out under c:/src/nvim-plugins/")
