@@ -1,0 +1,7 @@
+.luarocks/
+.luacheckcache
+*.swp
+*.swo
+.DS_Store
+tags
+.cache/
