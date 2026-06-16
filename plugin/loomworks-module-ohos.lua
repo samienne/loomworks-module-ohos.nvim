@@ -25,4 +25,5 @@ end, {
     nargs = "?",
     complete = function() return { "D", "I", "W", "E", "F" } end,
     desc = "loomworks: get/set on-device hilog level (D|I|W|E|F)",
+    force = true,
 })
