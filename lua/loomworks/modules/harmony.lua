@@ -68,21 +68,23 @@ local function hvigor_env(tool_data)
 end
 
 --- Wrap a script command for the platform.
---- On Windows: .bat/.cmd files need cmd /c with quoted paths.
+--- On Windows: .bat/.cmd files must run via `cmd /c`.
 --- On Unix: .sh files may need explicit shell invocation.
 --- @param cmd string[] command array
 --- @return string[]
 local function wrap_script_cmd(cmd)
     if is_win and (cmd[1]:match("%.bat$") or cmd[1]:match("%.cmd$")) then
-        local parts = {}
-        for _, arg in ipairs(cmd) do
-            if arg:match("%s") then
-                parts[#parts + 1] = '"' .. arg .. '"'
-            else
-                parts[#parts + 1] = arg
-            end
-        end
-        return { "cmd", "/c", table.concat(parts, " ") }
+        -- Pass the script path and its args as SEPARATE argv elements — do NOT
+        -- pre-quote them into one string. The process spawner (libuv, used by
+        -- both nvim's jobstart and the standalone host's uv.spawn) quotes each
+        -- element itself when building the Windows command line; a manually
+        -- quoted element gets its quotes escaped as \" , so `cmd` then looks for
+        -- a program literally named "\"...ohpm.bat\"" and fails. Let the spawner
+        -- quote: { "cmd", "/c", "C:\\...\\ohpm.bat", "install" } becomes
+        -- `cmd /c "C:\...\ohpm.bat" install`, which runs correctly.
+        local wrapped = { "cmd", "/c" }
+        for _, arg in ipairs(cmd) do wrapped[#wrapped + 1] = arg end
+        return wrapped
     end
     return cmd
 end
