@@ -888,49 +888,44 @@ function M.device_targets(project_ctx, active_config)
 end
 
 --- Enumerate connected devices via hdc.
+---
+--- Single-sourced with the ohos SDK device runner (spec/sdks/ohos.md §8;
+--- core §18.10): the same `hdc list targets -v` spec and parser, so the
+--- device registry holds one Device per serial whichever path listed it.
+--- hdc comes only from the SDK (`tool_data.hdc`, from the ohos provider's
+--- harmony capabilities) — there is no PATH fallback (core §17.7).
 --- @param tool_data table
---- @param callback fun(devices: { serial: string, display_name: string, state: string }[])
+--- @param callback fun(devices: { serial: string, display_name: string, state: string, properties: table }[])
 function M.list_devices(tool_data, callback)
-    local hdc = tool_data and tool_data.hdc
-    if not hdc then
-        -- Fall back to hdc on PATH
-        hdc = vim.fn.exepath("hdc")
-        if hdc == "" then hdc = nil end
-    end
-    if not hdc then
-        vim.notify("loomworks/harmony: hdc not found (tool_data or PATH)",
-            vim.log.levels.WARN)
+    local hdc_path = tool_data and tool_data.hdc
+    if not hdc_path then
+        vim.notify("loomworks/harmony: hdc not found — select a DevEco Studio SDK "
+            .. "for this profile (hdc is taken from the SDK only)", vim.log.levels.WARN)
         callback({})
         return
     end
-    vim.notify("loomworks/harmony: using hdc at " .. hdc, vim.log.levels.INFO)
 
-    local devices = {}
+    local runner = require("loomworks-module-ohos.runner").new({ hdc = hdc_path })
+    local spec = runner.list_devices()
+    local lines = {}
     local called = false
     local function finish()
         if called then return end
         called = true
-        callback(devices)
+        callback(runner.parse_devices(lines))
     end
 
-    vim.fn.jobstart({ hdc, "list", "targets" }, {
+    local argv = { spec.cmd }
+    vim.list_extend(argv, spec.args)
+    local job = vim.fn.jobstart(argv, {
         stdout_buffered = true,
         stderr_buffered = true,
         on_stdout = function(_, data)
-            for _, line in ipairs(data or {}) do
-                local serial = vim.trim(line)
-                if serial ~= "" and serial ~= "[Empty]" then
-                    devices[#devices + 1] = {
-                        serial = serial,
-                        display_name = serial,
-                        state = "online",
-                    }
-                end
-            end
+            vim.list_extend(lines, data or {})
         end,
         on_stderr = function(_, data)
             local msg = table.concat(data or {}, "\n")
-            if msg and msg ~= "" and vim.trim(msg) ~= "" then
+            if vim.trim(msg) ~= "" then
                 vim.notify("loomworks/harmony: hdc stderr: " .. msg,
                     vim.log.levels.WARN)
             end
@@ -943,6 +938,11 @@ function M.list_devices(tool_data, callback)
             finish()
         end,
     })
+    if not job or job <= 0 then
+        vim.notify("loomworks/harmony: cannot start hdc at " .. hdc_path,
+            vim.log.levels.WARN)
+        finish()
+    end
 end
 
 --- Detect hdc/hap-install failure from output (hdc exits 0 on errors).
@@ -1039,7 +1039,7 @@ end
 --- filter. Hilog `-L` is no longer applied at the device because it
 --- interacts badly with native logging in practice (see
 --- spec/modules/harmony.md §6.1).
-M.HILOG_LEVELS = { D = true, I = true, W = true, E = true, F = true }
+M.HILOG_LEVELS = require("loomworks-module-ohos.hilog").LEVELS
 
 --- Default soft-filter level when nothing is specified.
 M.HILOG_DEFAULT_LEVEL = "I"
