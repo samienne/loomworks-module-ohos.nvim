@@ -191,6 +191,38 @@ function M.check_output(lines)
     return table.concat(hits, " ")
 end
 
+--- Connector-only failure check: hdc's own `[Fail]` / `[F]` markers,
+--- nothing else. Used where the inspected lines may include DEVICE-side
+--- text (the exec script's pre/post lines, crash listings, describe): a
+--- program or utility writing `error: ...` must not read as a connector
+--- failure.
+---
+--- Real hdc shapes (host exit code 0 in every case):
+---   `[Fail]Error opening file: no such file or directory, path:<p>`
+---       (file recv of a missing file)
+---   `[Fail]Not match target founded, check connect-key please`
+---   `[Fail]ExecuteCommand need connect-key? please confirm a device by help info`
+---       (unknown / vanished serial)
+--- `hdc shell false` also exits 0 and prints nothing — a device-side
+--- status is only ever learned from the exec sentinel.
+---
+--- Ordering caveat: `hdc shell` merges the device's stderr into stdout
+--- WITHOUT preserving order — stderr may arrive before earlier stdout
+--- lines. Never infer anything from the relative order of lines.
+--- @param lines string[]
+--- @return string|nil error message (the line without its leading marker)
+function M.check_connector_output(lines)
+    for _, line in ipairs(lines or {}) do
+        local s = vim.trim(M.normalize_line(line))
+        if s:find("[Fail]", 1, true) or s:match("^%[F%]") then
+            -- Same shape as `check_output`: the leading marker is dropped.
+            local msg = s:gsub("^%[Fail%]%s*", ""):gsub("^%[F%]%s*", "")
+            return msg ~= "" and msg or s
+        end
+    end
+    return nil
+end
+
 -- ---------------------------------------------------------------------------
 -- Output parsers
 -- ---------------------------------------------------------------------------

@@ -127,6 +127,29 @@ describe("hdc.check_output", function()
     end)
 end)
 
+describe("hdc.check_output / check_connector_output: real hdc shapes", function()
+    local REAL = {
+        "[Fail]Error opening file: no such file or directory, path:/data/local/tmp/missing.xml",
+        "[Fail]Not match target founded, check connect-key please",
+        "[Fail]ExecuteCommand need connect-key? please confirm a device by help info",
+    }
+
+    it("both checks catch every shape, with or without CR", function()
+        for _, l in ipairs(REAL) do
+            assert.equals((l:gsub("^%[Fail%]", "")), hdc.check_output({ l }))
+            assert.equals((l:gsub("^%[Fail%]", "")), hdc.check_output({ "FileTransfer start", l .. "\r" }))
+            assert.equals((l:gsub("^%[Fail%]", "")), hdc.check_connector_output({ l .. "\r" }))
+            assert.equals((l:gsub("^%[Fail%]", "")), hdc.check_connector_output({ "some device text", l }))
+        end
+    end)
+
+    it("the connector check ignores device-side error text", function()
+        assert.is_nil(hdc.check_connector_output({ "error: bad input", "Segmentation fault", "" }))
+        assert.is_nil(hdc.check_connector_output(nil))
+        assert.equals("x", hdc.check_connector_output({ "[F]x" }))
+    end)
+end)
+
 describe("hdc.parse_targets", function()
     it("ignores [Empty] and blank lines", function()
         assert.same({}, hdc.parse_targets({ "[Empty]", "", "\r" }))
