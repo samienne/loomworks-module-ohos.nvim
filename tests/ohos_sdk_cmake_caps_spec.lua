@@ -104,4 +104,42 @@ describe("ohos SDK cmake capabilities", function()
             assert.equals("-DOHOS_ARCH=" .. e.label:match("/(.*)$"), e.args[1])
         end
     end)
+
+    it("declares a target-platform token per arch (core §10.7)", function()
+        local root = fake_sdk({ ninja = true })
+        roots[#roots + 1] = root
+        local sdk = ohos.create_sdk("ohos-test", root, "5.0.0")
+        local caps = ohos.query_capabilities(sdk, "cmake")
+        local by_name = {}
+        for _, p in ipairs(caps.platforms) do by_name[p.name] = p end
+        assert.same({ ["arm64-v8a"] = "ohos-aarch64" },
+            by_name.HarmonyOS.target_platform)
+        assert.same({ ["arm64-v8a"] = "ohos-aarch64", ["armeabi-v7a"] = "ohos-arm" },
+            by_name.OpenHarmony.target_platform)
+        -- Every arch of every platform has a token.
+        for _, p in ipairs(caps.platforms) do
+            for _, arch in ipairs(p.archs) do
+                assert.is_string(p.target_platform[arch], p.name .. "/" .. arch)
+            end
+        end
+    end)
+
+    it("tokens reach kits when core's kits_from_sdk supports them", function()
+        local root = fake_sdk({ ninja = true })
+        roots[#roots + 1] = root
+        local sdk = ohos.create_sdk("ohos-test", root, "5.0.0")
+        local caps = ohos.query_capabilities(sdk, "cmake")
+        local kits = require("loomworks.modules.cmake").kits_from_sdk(caps, sdk)
+        local any = false
+        for _, k in ipairs(kits) do
+            if k.target_platform ~= nil then any = true end
+        end
+        if not any then
+            pending("core cmake kits_from_sdk does not return target_platform yet")
+            return
+        end
+        for _, k in ipairs(kits) do
+            assert.equals(ohos.PLATFORM_TOKENS[k.tool_data.arch], k.target_platform)
+        end
+    end)
 end)

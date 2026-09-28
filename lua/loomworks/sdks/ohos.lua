@@ -30,6 +30,23 @@ local function resolve_tool(base, exts)
     return nil
 end
 
+--- Target-platform token per OHOS ABI (core §10.7 / §18.1; cmake module
+--- spec §15.1). This provider's own vocabulary: core only compares a
+--- kit's token for equality with the device runner's `platforms`.
+P.PLATFORM_TOKENS = {
+    ["arm64-v8a"] = "ohos-aarch64",
+    ["armeabi-v7a"] = "ohos-arm",
+}
+
+--- Per-arch token table for a platform's arch list.
+--- @param archs string[]
+--- @return table<string, string>
+local function platform_tokens(archs)
+    local t = {}
+    for _, arch in ipairs(archs) do t[arch] = P.PLATFORM_TOKENS[arch] end
+    return t
+end
+
 local exe_exts = is_win and { ".exe", "" } or { "", ".exe" }
 local script_exts = is_win and { ".bat", ".cmd", "" } or { "", ".sh" }
 
@@ -227,6 +244,7 @@ function P.query_capabilities(sdk, module_id)
                         "-DHMOS_SDK_NATIVE=" .. hmos_native,
                     }),
                 },
+                target_platform = platform_tokens({ "arm64-v8a" }),
             }
         end
         if uv.fs_stat(ohos_tc) then
@@ -244,6 +262,7 @@ function P.query_capabilities(sdk, module_id)
                         "-DOHOS_SDK_NATIVE=" .. ohos_native,
                     }),
                 },
+                target_platform = platform_tokens({ "arm64-v8a", "armeabi-v7a" }),
             }
         end
 
