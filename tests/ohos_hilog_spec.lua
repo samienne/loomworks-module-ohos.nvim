@@ -38,6 +38,17 @@ describe("hilog.parse_line", function()
         assert.equals("a: b: c", r.msg)
     end)
 
+    it("a proc-less line whose message holds slashes stays DOMAIN/TAG", function()
+        local r = hilog.parse_line("09-28 10:11:12.345  4242  4242 I C03F00/MUSL-LDSO: load /system/lib/x.so: ok")
+        assert.is_nil(r.proc)
+        assert.equals("MUSL-LDSO", r.tag)
+        assert.equals("load /system/lib/x.so: ok", r.msg)
+        local r2 = hilog.parse_line("09-28 10:11:12.345  4242  4242 I A03D00/api_unit_te/LumeTag: path /a/b: c")
+        assert.equals("api_unit_te", r2.proc)
+        assert.equals("LumeTag", r2.tag)
+        assert.equals("path /a/b: c", r2.msg)
+    end)
+
     it("returns nil + cleaned text for unparseable lines", function()
         local r, clean = hilog.parse_line("[Fail]ExecuteCommand need connect-key?\r")
         assert.is_nil(r)
@@ -54,6 +65,15 @@ describe("hilog.proc_matches", function()
         assert.is_false(hilog.proc_matches("com.example.apple", "com.example.app"))
         assert.is_false(hilog.proc_matches(nil, "x"))
         assert.is_false(hilog.proc_matches("x", ""))
+    end)
+
+    it("matches a right-truncated proc column and path names (device-seen)", function()
+        assert.is_true(hilog.proc_matches("api_unit_te", "api_unit_tests"))
+        assert.is_true(hilog.proc_matches("api_unit_te", "/data/local/tmp/.device-staging/w/u/api_unit_tests"))
+        assert.is_true(hilog.proc_matches("api_unit_tests", "/d/api_unit_tests"))
+        assert.is_false(hilog.proc_matches("api_u", "api_unit_tests"), "too short to trust")
+        assert.is_false(hilog.proc_matches("api_unit_tf", "api_unit_tests"))
+        assert.is_false(hilog.proc_matches("api_unit_tests_x", "api_unit_tests"))
     end)
 end)
 
@@ -86,6 +106,43 @@ describe("hilog.make_prefilter", function()
         assert.is_true(f(mine_noproc))
         assert.is_true(f(helper))
         assert.is_false(f(other))
+    end)
+
+    it("pid: pid only; degrades to proc without a pid", function()
+        local f = hilog.make_prefilter({ mode = "pid", pid = 4242, name = name })
+        assert.is_true(f(mine))
+        assert.is_true(f(mine_noproc))
+        assert.is_false(f(helper))
+        assert.is_false(f(other))
+        assert.is_true(f(raw))
+        assert.is_true(hilog.make_prefilter({ mode = "pid", name = name })(helper))
+        assert.is_false(hilog.make_prefilter({ mode = "pid" })(mine))
+    end)
+
+    it("real native-program shapes: truncated proc and proc-less system domains", function()
+        local lines = {
+            "09-28 14:02:11.101  8811  8811 I C03F00/MUSL-LDSO: dlopen libfoo.so",
+            "09-28 14:02:11.102  8811  8813 I C01300/PARAM_WATCHER: watcher started",
+            "09-28 14:02:11.200  8811  8811 E A03D00/api_unit_te/LumeScene: assertion failed",
+            "09-28 14:02:11.300  1234  1234 I A03D00/com.other.app/X: noise",
+        }
+        local rec = {}
+        for i, l in ipairs(lines) do rec[i] = assert(hilog.parse_line(l)) end
+        local prog = "/data/local/tmp/.device-staging/ws/u/test/unittest/api_unit_tests"
+        for _, mode in ipairs({ "pid", "app-related" }) do
+            local f = hilog.make_prefilter({ mode = mode, pid = 8811, name = prog })
+            assert.is_true(f(rec[1]), mode)
+            assert.is_true(f(rec[2]), mode)
+            assert.is_true(f(rec[3]), mode)
+            assert.is_false(f(rec[4]), mode)
+        end
+        -- Name-only (no pid known): the truncated proc still matches.
+        assert.is_true(hilog.make_prefilter({ mode = "app-related", name = prog })(rec[3]))
+        assert.is_true(hilog.make_prefilter({ mode = "strict", pid = 8811, name = prog })(rec[3]))
+        -- Soft filter: a full program name matches the truncated column.
+        assert.is_true(hilog.match_filter({ proc = "api_unit_tests" }, rec[3]))
+        assert.is_true(hilog.match_filter({ proc = "unit" }, rec[3]))
+        assert.is_false(hilog.match_filter({ proc = "api_unit_tests" }, rec[4]))
     end)
 
     it("all: everything", function()
@@ -139,10 +196,10 @@ describe("hilog.match_filter", function()
 end)
 
 describe("hilog.resolve_options", function()
-    it("native defaults: stdout live, hilog on failure, app-related, level W, tail 30", function()
+    it("native defaults: stdout live, hilog on failure, pid prefilter, level W, tail 30", function()
         local o = assert(hilog.resolve_options(nil, "native"))
         assert.equals("stdout", o.show)
-        assert.equals("app-related", o.prefilter)
+        assert.equals("pid", o.prefilter)
         assert.equals("W", o.level)
         assert.equals(30, o.tail)
         assert.same({ program = "live", log = "on_failure", tail = 30 }, o.show_policy)
@@ -168,6 +225,13 @@ describe("hilog.resolve_options", function()
         assert.equals("strict", o.prefilter)
         assert.equals("I", o.level)
         assert.same({ program = "off", log = "live", tail = 30 }, o.show_policy)
+    end)
+
+    it("accepts prefilter = pid for either target type", function()
+        assert.equals("pid", assert(hilog.resolve_options({ prefilter = "pid" }, "native")).prefilter)
+        assert.equals("pid", assert(hilog.resolve_options({ prefilter = "pid" }, "hap")).prefilter)
+        local _, err = hilog.resolve_options({ prefilter = "loose" }, "native")
+        assert.is_truthy(err:find("one of pid, strict, app-related, all", 1, true), err)
     end)
 
     it("hap rejects show values other than hilog", function()
@@ -245,7 +309,7 @@ describe("ohos runner log_session", function()
     end)
 
     it("receive applies the prefilter with the streamed pid, keeps raw lines", function()
-        local s = assert(r.log_session("S1", {}, program))   -- app-related
+        local s = assert(r.log_session("S1", {}, program))   -- pid
         s.stream(4242)
         assert.equals(L3, s.receive(L3 .. "\r"))
         assert.equals(L2, s.receive(L2))                    -- pid match, no proc

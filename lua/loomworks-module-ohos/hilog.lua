@@ -46,6 +46,10 @@ end
 ---   MM-DD HH:MM:SS.mmm PID TID LEVEL DOMAIN/PROC/TAG: msg
 ---   MM-DD HH:MM:SS.mmm PID TID LEVEL DOMAIN/TAG: msg        (proc = nil)
 ---
+--- PROC never contains whitespace: a proc-less line whose message holds
+--- a slash (`C03F00/MUSL-LDSO: load /system/lib/x.so: ok`) must parse as
+--- DOMAIN/TAG, not as proc `MUSL-LDSO: load `.
+---
 --- Returns `nil, cleaned` for a line in neither form; callers keep the
 --- cleaned text as a raw record (it reveals connector problems).
 --- @param line string
@@ -60,7 +64,7 @@ function M.parse_line(line)
         "^(%d%d%-%d%d %d%d:%d%d:%d%d%.%d+)%s+(%d+)%s+(%d+)%s+([A-Z])%s+(.*)$")
     if not time then return nil, line end
 
-    local domain, proc, tag, msg = rest:match("^([^/%s]+)/([^/]+)/([^:]+):%s?(.*)$")
+    local domain, proc, tag, msg = rest:match("^([^/%s]+)/([^/%s]+)/([^:]+):%s?(.*)$")
     if not domain then
         domain, tag, msg = rest:match("^([^/%s]+)/([^:]+):%s?(.*)$")
         proc = nil
@@ -93,28 +97,46 @@ M.LEVEL_RANK = { V = 0, D = 1, I = 2, W = 3, E = 4, F = 5 }
 -- Session prefilter
 -- ---------------------------------------------------------------------------
 
+--- Shortest proc column accepted as a right-truncated program name (a
+--- shorter prefix would match too many unrelated processes).
+M.MIN_TRUNCATED_PROC = 6
+
 --- Does hilog's proc column refer to `name` (bundle or program name)?
---- Exact match; `name.` / `name:` sub-process prefixes; or hilog's
---- left-truncated proc column for long names (`proc` is a suffix).
+--- `name` may be a path; only its last segment is compared. Accepted:
+--- an exact match; `name.` / `name:` sub-process prefixes; hilog's
+--- left-truncated proc column for long names (`proc` is a suffix); and a
+--- right-truncated proc column (`proc` is a prefix of at least
+--- `MIN_TRUNCATED_PROC` chars) — seen on a device for a native program:
+--- `api_unit_te` for `api_unit_tests…`.
 --- @param proc string|nil
 --- @param name string|nil
 --- @return boolean
 function M.proc_matches(proc, name)
-    if not proc or not name or name == "" or proc == "" then return false end
+    if type(proc) ~= "string" or type(name) ~= "string" then return false end
+    name = name:match("([^/]+)/*$") or name
+    if name == "" or proc == "" then return false end
     if proc == name then return true end
     local prefix = proc:sub(1, #name + 1)
     if prefix == name .. "." or prefix == name .. ":" then return true end
     if #name > #proc and name:sub(-#proc) == proc then return true end
+    if #name > #proc and #proc >= M.MIN_TRUNCATED_PROC and name:sub(1, #proc) == proc then
+        return true
+    end
     return false
 end
 
 --- Build the session prefilter (applied on receive; drops are final).
+---   pid         — pid matches (degrades to proc matching when no pid is
+---                 known). The native-executable default: hilog's proc
+---                 column is unreliable for native programs (truncated,
+---                 and absent for system domains like MUSL-LDSO).
 ---   strict      — pid matches AND proc matches (degrades to whichever
----                 of the two is known)
+---                 of the two is known). Drops pid-matched records
+---                 without a proc column (system domains) — use `pid`.
 ---   app-related — pid matches OR proc matches
 ---   all         — everything
 --- Raw (unparseable) and header records always pass.
---- @param opts { mode?: "strict"|"app-related"|"all", pid?: integer, name?: string, bundle?: string }
+--- @param opts { mode?: "pid"|"strict"|"app-related"|"all", pid?: integer, name?: string, bundle?: string }
 --- @return fun(record: table): boolean
 function M.make_prefilter(opts)
     opts = opts or {}
@@ -123,6 +145,15 @@ function M.make_prefilter(opts)
     local name = opts.name or opts.bundle
 
     if mode == "all" then return function() return true end end
+
+    if mode == "pid" then
+        return function(record)
+            if not record then return false end
+            if record.header or record.raw then return true end
+            if pid then return record.pid == pid end
+            return name ~= nil and M.proc_matches(record.proc, name)
+        end
+    end
 
     if mode == "app-related" then
         return function(record)
@@ -191,7 +222,8 @@ function M.render(record, layout)
 end
 
 --- Soft filter (applied on display). AND over every set field:
---- `pid`, `proc` (contains), `tag` (contains), `level` (minimum), `grep`
+--- `pid`, `proc` (contains, or `M.proc_matches` so a full program name
+--- matches a truncated proc column), `tag` (contains), `level` (minimum), `grep`
 --- (Lua pattern the rendered line must match; `regex` is an alias kept
 --- for core's view), `exclude` (Lua pattern the rendered line must NOT
 --- match). Header records always pass; raw records are hidden only by a
@@ -211,7 +243,8 @@ function M.match_filter(filter, record, rendered)
     if record.raw then return true end
 
     if filter.pid and record.pid ~= filter.pid then return false end
-    if filter.proc and not (record.proc and record.proc:find(filter.proc, 1, true)) then
+    if filter.proc and not (record.proc and (record.proc:find(filter.proc, 1, true)
+            or M.proc_matches(record.proc, filter.proc))) then
         return false
     end
     if filter.tag and not (record.tag and record.tag:find(filter.tag, 1, true)) then
@@ -233,7 +266,7 @@ end
 M.OPTION_KEYS = { "show", "prefilter", "level", "tag", "proc", "grep", "exclude", "tail" }
 
 local SHOW = { stdout = true, hilog = true, both = true }
-local PREFILTER = { strict = true, ["app-related"] = true, all = true }
+local PREFILTER = { pid = true, strict = true, ["app-related"] = true, all = true }
 
 --- Defaults by target type. `level = nil` means "derived from show".
 M.DEFAULTS = {
@@ -241,7 +274,9 @@ M.DEFAULTS = {
     hap = { show = "hilog", prefilter = "strict", level = "I", tail = 30 },
     -- native executable (ohos runner, core §18): program output live,
     -- hilog captured and printed (last `tail` lines) only on failure.
-    native = { show = "stdout", prefilter = "app-related", level = nil, tail = 30 },
+    -- Prefilter by pid only: the stream is `hilog -P <pid>` and the proc
+    -- column is truncated / absent for native programs (device-verified).
+    native = { show = "stdout", prefilter = "pid", level = nil, tail = 30 },
 }
 
 local function known_keys()
@@ -302,7 +337,7 @@ function M.resolve_options(options, target_type)
 
     local pf = options.prefilter
     if pf ~= nil and (type(pf) ~= "string" or not PREFILTER[pf]) then
-        return nil, bad("prefilter", pf, "one of strict, app-related, all")
+        return nil, bad("prefilter", pf, "one of pid, strict, app-related, all")
     end
     o.prefilter = pf or defaults.prefilter
 

@@ -286,15 +286,24 @@ always pass.
 
 | Mode | Keeps a record when |
 |------|---------------------|
-| `strict` | pid matches **and** proc matches the bundle / program name (degrades to whichever is known) |
+| `pid` | pid matches (degrades to proc matching when no pid is known). Default for native executables: their proc column is truncated and system-domain records (`MUSL-LDSO`, `PARAM_WATCHER`) have none |
+| `strict` | pid matches **and** proc matches the bundle / program name (degrades to whichever is known); drops pid-matched records without a proc column |
 | `app-related` | pid matches **or** proc matches |
 | `all` | always |
 
-Proc matching accepts an exact match, `name.` / `name:` sub-process
-prefixes, and hilog's left-truncated proc column for long names.
+Proc matching compares against the name's last path segment and
+accepts an exact match, `name.` / `name:` sub-process prefixes, hilog's
+left-truncated proc column for long names (proc is a suffix), and a
+right-truncated proc column (proc is a prefix of at least 6 characters —
+device-seen: `api_unit_te` for a longer test program name).
+
+**Line grammar note.** PROC never contains whitespace, so a proc-less
+line whose message holds a slash (`C03F00/MUSL-LDSO: load /system/lib/x.so`)
+parses as `DOMAIN/TAG: msg`.
 
 **Soft filter** (on display; AND over every set field): minimum `level`
-(`D < I < W < E < F`; `V` lowest), `tag` substring, `proc` substring,
+(`D < I < W < E < F`; `V` lowest), `tag` substring, `proc` substring (or
+a proc match as above, so a full program name matches a truncated column),
 `pid`, `grep` (Lua pattern the rendered line must match) and `exclude`
 (Lua pattern it must not match). Raw records are hidden only by a
 pattern.
@@ -307,7 +316,7 @@ rejected with an error naming it and listing the known keys:
 | Key | Values | Meaning |
 |-----|--------|---------|
 | `show` | `stdout` \| `hilog` \| `both` | What is shown live. HAP apps have no stdout: only `hilog` is accepted for them |
-| `prefilter` | `strict` \| `app-related` \| `all` | Session prefilter mode |
+| `prefilter` | `pid` \| `strict` \| `app-related` \| `all` | Session prefilter mode |
 | `level` | `D` \| `I` \| `W` \| `E` \| `F` (case-insensitive) | Soft-filter minimum level |
 | `tag` | text | Soft filter: tag contains |
 | `proc` | text | Soft filter: proc contains |
@@ -323,7 +332,7 @@ data only; none ever becomes device command text.
 | | `.hap` app (this module) | native executable (ohos runner) |
 |--|--|--|
 | `show` | `hilog` — the view opens live | `stdout` live; hilog captured and printed filtered (last `tail` lines) only on failure or crash |
-| `prefilter` | `strict` (`device_log_strict_pid = false` keeps today's no-`-P` opt-out) | `app-related` (the stream is already restricted by `-P`) |
+| `prefilter` | `strict` (`device_log_strict_pid = false` keeps today's no-`-P` opt-out) | `pid` (the stream is already restricted by `-P`; proc is unreliable for native programs) |
 | `level` | `I` (setup `device_log_level` overrides in the editor view) | `W` while hilog is shown only on failure; `I` when `show` is `hilog` or `both` |
 | `tail` | 30 (unused) | 30 |
 

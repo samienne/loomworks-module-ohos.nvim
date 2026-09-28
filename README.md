@@ -65,11 +65,12 @@ resolve automatically. No core changes required.
 
 Runs on a device accept hilog options, from a launch configuration's
 `device_log` table or `lw … --log key=value`:
-`show` (`stdout` | `hilog` | `both`), `prefilter` (`strict` |
+`show` (`stdout` | `hilog` | `both`), `prefilter` (`pid` | `strict` |
 `app-related` | `all`), `level` (`D`…`F`), `tag`, `proc`, `grep`,
 `exclude` (Lua patterns), `tail`. For a native executable the default is
-program output live and hilog (level `W`, last 30 lines) printed only when
-the run fails; e.g. `lw run P Runner --log show=both --log level=D`. See
+program output live and hilog — selected by the program's pid
+(`prefilter=pid`), level `W`, last 30 lines — printed only when the run
+fails; e.g. `lw run P Runner --log show=both --log level=D`. See
 [`spec/modules/harmony.md`](spec/modules/harmony.md) §6.5.
 
 ## Commands
