@@ -135,6 +135,29 @@ describe("ohos runner exec script", function()
         }, "; "), s)
     end)
 
+    it("housekeeping requests: no cwd / env / library_dirs emits no cd", function()
+        local s = render({ argv = { "mkdir", "-p", "/d/x y" }, nonce = "hk1" })
+        assert.equals(table.concat({
+            "sh -c 'echo __LW_PID_hk1=$$; exec \"$0\" \"$@\"' mkdir -p '/d/x y'",
+            "echo __LW_EXIT_hk1=$?",
+        }, "; "), s)
+        assert.equals(s, render({ argv = { "mkdir", "-p", "/d/x y" }, cwd = "", env = {},
+            library_dirs = {}, nonce = "hk1" }))
+        assert.has_error(function() render({ argv = { "/p" }, cwd = 5, nonce = "n" }) end)
+    end)
+
+    it("housekeeping utilities resolve through the device shell (real sh)", function()
+        if vim.fn.executable("sh") ~= 1 then
+            pending("no sh on PATH")
+            return
+        end
+        local out = vim.fn.systemlist({ "sh", "-c", render({ argv = { "echo", "hi there" }, nonce = "u1" }) })
+        for i, l in ipairs(out) do out[i] = l:gsub("\r$", "") end
+        assert.is_number(runner_mod.parse_pid(out[1], "u1"))
+        assert.equals("hi there", out[2])
+        assert.equals(0, runner_mod.parse_exit(out[3], "u1"))
+    end)
+
     it("omits LD_LIBRARY_PATH without library dirs and ignores it in env", function()
         local s = render({ argv = { "/p" }, cwd = "/", env = { LD_LIBRARY_PATH = "/evil" }, nonce = "n" })
         assert.is_nil(s:find("LD_LIBRARY_PATH", 1, true))

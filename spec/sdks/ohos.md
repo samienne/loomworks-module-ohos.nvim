@@ -222,6 +222,13 @@ K='V' … LD_LIBRARY_PATH='<d1>:<d2>'"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" sh 
 echo __LW_EXIT_<n>=$?
 ```
 
+- The `cd` line is omitted when the request has no `cwd` (nil or empty);
+  `env` and `library_dirs` may be absent or empty. Core's staging
+  housekeeping (`mkdir -p`, `chmod 755`, `rm`, `tar -xf`, `sha256sum`)
+  uses utility names as `argv[1]`; `exec "$0"` resolves them through the
+  device shell's `PATH`.
+- The parsers escape the nonce with a local helper, not `vim.pesc`: the
+  runner also runs under the standalone `lw` host's `vim` shim.
 - Env names are emitted unquoted (a quoted name is not an assignment) and
   must be portable identifiers; values are single-quoted. Assignments are
   sorted by name. An `LD_LIBRARY_PATH` entry in `env` is ignored: the

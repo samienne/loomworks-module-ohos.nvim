@@ -34,6 +34,13 @@ M.ARCH_TRIPLE = {
 local EXIT_TAG = "__LW_EXIT_"
 local PID_TAG = "__LW_PID_"
 
+--- Escape Lua pattern magic characters. Local (not `vim.pesc`): the
+--- runner also runs under the standalone `lw` host, whose `vim` shim
+--- provides only a subset of the editor API.
+local function pesc(s)
+    return (s:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"))
+end
+
 local function check_nonce(nonce)
     if type(nonce) ~= "string" or not nonce:match("^%w+$") then
         error("ohos runner: nonce must be alphanumeric", 3)
@@ -53,15 +60,19 @@ end
 --- assignment — which is safe because they are checked to be portable
 --- identifiers (core refuses anything else before calling us; we check
 --- again). Every value and argument is single-quoted (`hdc.quote`).
---- @param request { argv: string[], cwd: string, env?: table<string,string>, library_dirs?: string[], nonce: string }
+--- @param request { argv: string[], cwd?: string, env?: table<string,string>, library_dirs?: string[], nonce: string }
 --- @return string script ONE device command line
 function M.render_exec_script(request)
     check_nonce(request.nonce)
     local argv = request.argv or {}
     if #argv == 0 then error("ohos runner: exec request has an empty argv", 2) end
-    if type(request.cwd) ~= "string" or request.cwd == "" then
-        error("ohos runner: exec request has no cwd", 2)
+    -- cwd is optional: without one (nil / empty) the program runs in the
+    -- device shell's default directory and no `cd` is emitted.
+    local cwd = request.cwd
+    if cwd ~= nil and type(cwd) ~= "string" then
+        error("ohos runner: exec request cwd must be a string", 2)
     end
+    if cwd == "" then cwd = nil end
     local n = request.nonce
 
     local assigns = {}
@@ -95,11 +106,13 @@ function M.render_exec_script(request)
     run[#run + 1] = "sh -c " .. hdc.quote(inner)
     run[#run + 1] = hdc.join(argv)
 
-    return table.concat({
-        "cd " .. hdc.quote(request.cwd) .. " || { echo " .. EXIT_TAG .. n .. "=126; exit 126; }",
-        table.concat(run, " "),
-        "echo " .. EXIT_TAG .. n .. "=$?",
-    }, "; ")
+    local parts = {}
+    if cwd then
+        parts[#parts + 1] = "cd " .. hdc.quote(cwd) .. " || { echo " .. EXIT_TAG .. n .. "=126; exit 126; }"
+    end
+    parts[#parts + 1] = table.concat(run, " ")
+    parts[#parts + 1] = "echo " .. EXIT_TAG .. n .. "=$?"
+    return table.concat(parts, "; ")
 end
 
 --- Recognise the exit sentinel for `nonce`.
@@ -116,7 +129,7 @@ end
 function M.parse_exit(line, nonce)
     if type(line) ~= "string" or type(nonce) ~= "string" then return nil end
     line = hdc.normalize_line(line)
-    local pre, st = line:match("^(.-)" .. vim.pesc(EXIT_TAG .. nonce) .. "=(%d+)$")
+    local pre, st = line:match("^(.-)" .. pesc(EXIT_TAG .. nonce) .. "=(%d+)$")
     if not st then return nil end
     return tonumber(st), (pre ~= "" and pre or nil)
 end
@@ -129,7 +142,7 @@ end
 function M.parse_pid(line, nonce)
     if type(line) ~= "string" or type(nonce) ~= "string" then return nil end
     line = hdc.normalize_line(line)
-    local pid = line:match("^" .. vim.pesc(PID_TAG .. nonce) .. "=(%d+)$")
+    local pid = line:match("^" .. pesc(PID_TAG .. nonce) .. "=(%d+)$")
     return pid and tonumber(pid) or nil
 end
 
