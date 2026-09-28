@@ -144,13 +144,23 @@ HarmonyOS device connector.
 
 | Method | Command shape |
 |--------|---------------|
-| `list_devices` | `hdc list targets` |
+| `list_devices` | `hdc list targets -v` (via the ohos device runner, below) |
 | `device_install` | `hdc -t <serial> install <artifact>` |
 | `device_launch` | `hdc -t <serial> shell aa start -a <ability> -b <bundle>` |
 | `device_stop` | `hdc -t <serial> shell aa force-stop -b <bundle>` |
 | `device_pid` | `hdc -t <serial> shell pidof <bundle>` |
 | `device_log` | `hdc -t <serial> shell hilog [-P pid] [-T tag] [-t type]` (streaming) |
 | `device_log_clear` | `hdc -t <serial> shell hilog -r` |
+
+`hdc` is `tool_data.hdc`, which the ohos SDK provider resolves from the
+installation (`sdk/default/openharmony/toolchains/hdc`). There is **no
+`PATH` fallback** (core §17.7): without an SDK hdc, `list_devices` warns
+and reports no devices. `list_devices` delegates to the ohos device
+runner's `list_devices` spec and `parse_devices` parser (ohos.md §8.3;
+core §18.10), so device listing is single-sourced: a device picked for a
+HAP launch is the same Device a remote run uses, and verbose output gives
+real online/offline state. hdc argv building and failure detection come
+from the shared helper `lua/loomworks-module-ohos/hdc.lua` (ohos.md §8.1).
 
 The `device_log` command is invoked through `shell hilog` (not the
 top-level `hdc hilog` passthrough, which ignores filter flags). The
@@ -253,6 +263,84 @@ Returned as a table passed to `device_launch()` as `launch_info`.
 
 Locates the built HAP file within the hvigor output tree based on
 the active product/target/mode.
+
+### 6.5 hilog: records, filters, log options
+
+hilog knowledge — line grammar, levels, session prefilter, soft filter,
+option vocabulary and defaults — lives in
+`lua/loomworks-module-ohos/hilog.lua`, shared by this module (HAP apps,
+core §11) and the ohos device runner's log session (native executables,
+ohos.md §8.5; core §18.13). Core's `device_log.lua` still carries its own
+copy of the parser and filters for the editor view until core grows the
+generic device-log seam (a `device_log_format` hook; deferred), at which
+point the view will take them from here.
+
+**Records.** Each line is sanitized (BOM, ANSI CSI/OSC/single-char
+escapes, headless CSI remnants like `[41;155H`, C0 controls, trailing CR),
+then parsed from `MM-DD HH:MM:SS.mmm PID TID LEVEL DOMAIN/PROC/TAG: msg`,
+falling back to `DOMAIN/TAG: msg` (`proc = nil`). A line in neither form
+is a **raw** record and is kept (it reveals connector problems).
+
+**Session prefilter** (on receive; dropped records are gone). Raw records
+always pass.
+
+| Mode | Keeps a record when |
+|------|---------------------|
+| `pid` | pid matches (degrades to proc matching when no pid is known). Default for native executables: their proc column is truncated and system-domain records (`MUSL-LDSO`, `PARAM_WATCHER`) have none |
+| `strict` | pid matches **and** proc matches the bundle / program name (degrades to whichever is known); drops pid-matched records without a proc column |
+| `app-related` | pid matches **or** proc matches |
+| `all` | always |
+
+Proc matching compares against the name's last path segment and
+accepts an exact match, `name.` / `name:` sub-process prefixes, hilog's
+left-truncated proc column for long names (proc is a suffix), and a
+right-truncated proc column (proc is a prefix of at least 6 characters —
+device-seen: `api_unit_te` for a longer test program name).
+
+**Line grammar note.** PROC never contains whitespace, so a proc-less
+line whose message holds a slash (`C03F00/MUSL-LDSO: load /system/lib/x.so`)
+parses as `DOMAIN/TAG: msg`.
+
+**Soft filter** (on display; AND over every set field): minimum `level`
+(`D < I < W < E < F`; `V` lowest), `tag` substring, `proc` substring (or
+a proc match as above, so a full program name matches a truncated column),
+`pid`, `grep` (Lua pattern the rendered line must match) and `exclude`
+(Lua pattern it must not match). Raw records are hidden only by a
+pattern.
+
+**Log options** — the keys accepted in a launch configuration's
+`device_log` table and in `lw … --log key=value` (core §18.13). Values
+may be typed (JSON) or strings (CLI). An unknown key or bad value is
+rejected with an error naming it and listing the known keys:
+
+| Key | Values | Meaning |
+|-----|--------|---------|
+| `show` | `stdout` \| `hilog` \| `both` | What is shown live. HAP apps have no stdout: only `hilog` is accepted for them |
+| `prefilter` | `pid` \| `strict` \| `app-related` \| `all` | Session prefilter mode |
+| `level` | `D` \| `I` \| `W` \| `E` \| `F` (case-insensitive) | Soft-filter minimum level |
+| `tag` | text | Soft filter: tag contains |
+| `proc` | text | Soft filter: proc contains |
+| `grep` | Lua pattern | Soft filter: rendered line matches |
+| `exclude` | Lua pattern | Soft filter: rendered line does not match |
+| `tail` | non-negative integer | Lines printed when hilog is shown on failure only |
+
+Empty `tag` / `proc` / `grep` / `exclude` mean unset. Option values are
+data only; none ever becomes device command text.
+
+**Defaults by target type** (`hilog.DEFAULTS`):
+
+| | `.hap` app (this module) | native executable (ohos runner) |
+|--|--|--|
+| `show` | `hilog` — the view opens live | `stdout` live; hilog captured and printed filtered (last `tail` lines) only on failure or crash |
+| `prefilter` | `strict` (`device_log_strict_pid = false` keeps today's no-`-P` opt-out) | `pid` (the stream is already restricted by `-P`; proc is unreliable for native programs) |
+| `level` | `I` (setup `device_log_level` overrides in the editor view) | `W` while hilog is shown only on failure; `I` when `show` is `hilog` or `both` |
+| `tail` | 30 (unused) | 30 |
+
+The resolved show policy is core's `{ program, log, tail }`: `stdout` →
+`{ live, on_failure }`, `hilog` → `{ off, live }`, `both` → `{ live, live }`
+(HAP: always `{ off, live }`). The full prefiltered hilog of a runner run is
+always saved to `device.log` in the run folder, independent of `show` and
+of the soft filter.
 
 ## 7. LSP integration
 

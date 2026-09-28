@@ -76,6 +76,7 @@ OpenHarmony, or both):
             ["arm64-v8a"] = { "-DOHOS_ARCH=...", "-DOHOS_SDK_NATIVE=...", ... },
             ...
         },
+        target_platform = { ["arm64-v8a"] = "ohos-aarch64", ["armeabi-v7a"] = "ohos-arm" },
     }, ... },
     cmake_path = .../native/build-tools/cmake/bin/cmake,
     clangd_path = .../native/llvm/bin/clangd,
@@ -91,6 +92,15 @@ cmake+ninja pairing rather than the first ninja on PATH. Core's cmake
 kits have no dedicated make-program field, so it rides in the extra args;
 core appends user configuration options after kit args, so a user-set
 `CMAKE_MAKE_PROGRAM` still wins. Without a bundled ninja no pin is emitted.
+
+Each platform entry also carries `target_platform`, a per-arch table of
+target-platform tokens (core §10.7; cmake module spec §15.1):
+`arm64-v8a` → `"ohos-aarch64"`, `armeabi-v7a` → `"ohos-arm"` (both
+HarmonyOS and OpenHarmony). The cmake module copies the token onto each
+kit; core routes a foreign build to this provider's device runner (§8) by
+comparing it with the runner's `platforms`. The tokens are this
+provider's own vocabulary and are not part of kit identity. The table is
+`P.PLATFORM_TOKENS`.
 
 `clangd_required = true` because the SDK-bundled clangd knows
 platform headers that stock PATH-clangd cannot locate. Falling back
@@ -126,3 +136,220 @@ BACKLOG.md. The current shape resolves SDK-supplied tools lazily via
 `Profile:tool_for(module)` rather than persisting them in the
 profile's `tools` dict. That keeps SDK refresh cheap (re-query on
 load) at the cost of slightly more code in the access path.
+
+## 8. Device runner (`device_runner`)
+
+Implements core §18.2 (remote execution on devices) for DevEco Studio
+installations: plain native executables built by this provider's cmake
+kits (§4.2) run on an attached HarmonyOS/OpenHarmony device through
+`hdc`. The runner only builds command specs and parses output — core
+spawns every process and owns timeouts, cancellation, line-ending
+normalization and the device lock. Code:
+`lua/loomworks-module-ohos/runner.lua`, returned by
+`P.device_runner(sdk)`.
+
+`device_runner(sdk)` returns `nil` when the installation has no hdc
+(`<deveco>/sdk/default/openharmony/toolchains/hdc[.exe]`). The hdc path
+comes only from the SDK installation — never from `PATH`, never from
+cached tool data (core §17.7). The harmony module follows the same rule
+(harmony.md §6.1).
+
+### 8.1 hdc helper
+
+All hdc knowledge lives in `lua/loomworks-module-ohos/hdc.lua`, shared by
+the runner and the harmony module:
+
+- **argv** — `-t <serial> <subcommand…>`; every device command is
+  `-t <serial> shell <command>` with `<command>` as **one** argv element.
+  Verified on a device: everything after `shell` passed as one element
+  reaches the device `sh` intact.
+- **Quoting** — every device-side word is POSIX single-quoted (`'` →
+  `'\''`); words made only of `[A-Za-z0-9-._/:,+@%]` are left bare. `=` and
+  `~` are never bare (assignment / tilde expansion). NUL and line breaks
+  are refused.
+- **Local paths** — rendered with backslashes on Windows (hdc treats a
+  forward-slash host path as relative there). Device paths stay POSIX.
+- **Failure detection** — hdc exits 0 on failure. Two checks, both CRLF
+  tolerant, both returning the message without its leading marker:
+  - `check_output` — `[Fail]`/`[F]` markers and `error:` lines
+    (harmony.md §6.2). Used by `push` / `pull` and the harmony module,
+    whose output is hdc's own.
+  - `check_connector_output` — `[Fail]`/`[F]` markers **only**. Used
+    wherever the inspected lines can contain device-side text (`exec`,
+    `crash_snapshot`, `describe_device`): a program or utility printing
+    `error: …` is not a connector failure.
+
+  Real shapes (device-verified, host exit code 0 in all):
+  `[Fail]Error opening file: no such file or directory, path:<p>`
+  (recv of a missing file); `[Fail]Not match target founded, check
+  connect-key please` and `[Fail]ExecuteCommand need connect-key? please
+  confirm a device by help info` (unknown serial). `hdc shell false` also
+  exits 0 — a device status comes only from the exec sentinel.
+  **Ordering caveat:** `hdc shell` merges device stderr into stdout
+  without preserving order; stderr may arrive before earlier stdout
+  lines. Nothing may be inferred from the relative order of lines (this
+  is why `exec` uses the connector-only check: out-of-order program
+  stderr can land before the pid line or after the sentinel).
+- **`list targets [-v]` parsing** — `[Empty]` and blank lines are not
+  devices; verbose lines `<serial> <conn> <state> <host>` give
+  `state = online` iff `Connected` and `properties.connection`; plain
+  lines (bare serial) are `online`.
+- **Digest parsing** — `<hex>  <path>` / `<hex> *<path>` lines
+  (sha256sum / md5sum format); error lines are skipped.
+- **Line endings** — `hdc shell` output ends in CRLF. Core normalizes;
+  every parser here still strips a trailing CR.
+
+### 8.2 Identity and capabilities
+
+| Field | Value |
+|-------|-------|
+| `id` | `"ohos"` |
+| `platforms` | `{ "ohos-aarch64", "ohos-arm" }` — the tokens of §4.2 |
+| `staging_base` | `/data/local/tmp/.device-staging` |
+| `archive` | `true` (device `tar -xf`, toybox) |
+| `digest` | `{ "sha256sum" }` — see §8.6 |
+| `combined_output` | `true` — `hdc shell` delivers the program's stderr merged into stdout (verified) |
+| `timeouts` | not overridden (core defaults) |
+
+### 8.3 Builders
+
+| Builder | argv after `hdc` | Parsing / checks |
+|---------|------------------|------------------|
+| `list_devices()` | `list targets -v` | `parse_devices` = the §8.1 parser |
+| `push(s, l, r)` | `-t s file send <l> <r>` | `<l>` rendered per §8.1; `check_output` |
+| `pull(s, r, l)` | `-t s file recv <r> <l>` | same |
+| `exec(s, req)` | `-t s shell <script>` (one element) | §8.4; `check_connector_output` |
+| `parse_exit(line, n)` | — | `__LW_EXIT_<n>=<status>` at the **end** of the line (after CR strip). Returns the status and, as a second value, any program text that preceded the sentinel on the same line (a last output line without a newline) |
+| `parse_pid(line, n)` | — | whole line `__LW_PID_<n>=<pid>` |
+| `terminate(s, n, pid)` | `-t s shell "kill <pid> 2>/dev/null; sleep 1; kill -9 <pid> 2>/dev/null"` | only a positive integer pid (from `parse_pid`); without one it returns `nil` (nothing sent) |
+| `crash_snapshot(s)` | `-t s shell 'for f in /data/log/faultlog/faultlogger/cppcrash-* /data/log/faultlog/temp/cppcrash-*; do [ -e "$f" ] && echo "$f"; done'` | returns the spec (`check_connector_output`) and `parse(lines)` → set of **full paths** of `cppcrash-*` files directly in either directory (§8.7); other lines are ignored |
+| `crash_collect(b, a, ctx?)` | — | sorted paths in `a` not in `b`: every new faultlogger report, and new temp dumps — only `cppcrash-<pid>-…` when `ctx.pid` is given, all of them otherwise (§8.7) |
+| `describe_device(s)` | `-t s shell 'for k in const.product.marketname const.product.model const.product.name; do echo "$k=$(param get $k 2>/dev/null)"; done'` | *(optional, §8.8)* returns the spec (`check_connector_output`) and `parse(lines)` → `{ display_name?, properties }` or `nil` |
+| `runtime_files(tool)` | — | `{ local = <sdk>/sdk/default/openharmony/native/llvm/lib/<triple>/libc++_shared.so, relative = "libc++_shared.so" }` for the tool's `arch` (`arm64-v8a` → `aarch64-linux-ohos`, `armeabi-v7a` → `arm-linux-ohos`, `x86_64` → `x86_64-linux-ohos`), **always** staged (harmless for a static-STL program; the runner sees only the tool, not the configuration's `OHOS_STL`). Empty when the arch is unknown or the file is absent. Accepts a Tool (`tool.data`) or raw tool data |
+| `log_session(s, opts, program)` | — | §8.5 |
+
+Directory sends (`hdc file send <dir>`) are never used.
+
+### 8.4 The exec script
+
+Built from the structured request `{ argv, cwd, env, library_dirs, nonce }`
+and joined with `; ` into the single `shell` argument:
+
+```sh
+cd '<cwd>' || { echo __LW_EXIT_<n>=126; exit 126; }
+K='V' … LD_LIBRARY_PATH='<d1>:<d2>'"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" sh -c 'echo __LW_PID_<n>=$$; exec "$0" "$@"' '<prog>' '<argv2>' …
+echo __LW_EXIT_<n>=$?
+```
+
+- `<prog>` is `./<basename>` when `argv[1]` is an absolute path whose
+  directory equals `cwd` (trailing slashes ignored); otherwise `argv[1]`
+  unchanged (bare utility names, relative paths, programs elsewhere).
+  Reason (device-verified): faultloggerd records the crashing process
+  name from its exec path truncated to 128 bytes, and for a program
+  exec'd by its long absolute staging path hiview published **no**
+  faultlogger report; exec'd as `./<name>` from its directory it did.
+  `exec "$0" "$@"` and the pid announcement are unchanged.
+- The `cd` line is omitted when the request has no `cwd` (nil or empty);
+  `env` and `library_dirs` may be absent or empty. Core's staging
+  housekeeping (`mkdir -p`, `chmod 755`, `rm`, `tar -xf`, `sha256sum`)
+  uses utility names as `argv[1]`; `exec "$0"` resolves them through the
+  device shell's `PATH`.
+- The parsers escape the nonce with a local helper, not `vim.pesc`: the
+  runner also runs under the standalone `lw` host's `vim` shim.
+- Env names are emitted unquoted (a quoted name is not an assignment) and
+  must be portable identifiers; values are single-quoted. Assignments are
+  sorted by name. An `LD_LIBRARY_PATH` entry in `env` is ignored: the
+  loader path comes only from `library_dirs` (core §18.9), whose entries
+  may not contain `:`; the device's existing value is appended.
+- The inner `sh -c … exec` makes the announced pid the program's own (exec
+  keeps the pid), needed by `hilog -P` and `terminate`; the outer shell
+  survives to print the exit sentinel.
+- The nonce must be alphanumeric, so sentinel lines need no quoting.
+- hdc exits 0 whatever the device status, so the sentinel is the only
+  source of the exit status.
+
+### 8.5 Log session (core §18.13)
+
+`log_session(serial, options, program)` validates `options` against the
+hilog option vocabulary (harmony.md §6.5) with the **native executable**
+defaults and returns `nil, err` for an unknown key or bad value.
+Otherwise it returns:
+
+| Member | Value |
+|--------|-------|
+| `clear` | `-t s shell "hilog -r"` |
+| `stream(pid)` | `-t s shell "hilog -P <pid>"` — only `-P`: no `-L` (suppresses some native log paths), no `-t`/`-T` (native `OH_LOG_Print` lands on type `core`; tags are filtered client-side). Without a valid pid: `hilog`. Also fixes the pid the prefilter uses |
+| `receive(line)` | sanitize → parse → session prefilter (`prefilter` mode — default `pid` for native programs, harmony.md §6.5 — the streamed pid, `program.name` as proc). Unparseable lines are kept raw. Returns the sanitized line or `nil` |
+| `display(line)` | parse → soft filter (`level`, `tag`, `proc`, `grep`, `exclude`; AND) → compact rendering (`HH:MM:SS.mmm PID L [PROC/]TAG: msg`); raw lines shown as-is unless a pattern hides them; `nil` when filtered out |
+| `show` | `stdout` → `{ program = live, log = on_failure, tail }`; `hilog` → `{ program = off, log = live, tail }`; `both` → `{ program = live, log = live, tail }` |
+| `options` | the resolved options (diagnostic; not part of the core contract) |
+
+Option values are data: none is ever interpolated into a device command
+(only the integer pid is).
+
+### 8.6 Device facts (first real run) and what stays unverified
+
+Verified on a Mate 60 Pro (HarmonyOS, toybox 0.8.12): `hdc shell` runs as
+root (uid 0, `u:r:su:s0`); `sha256sum`, `md5sum` and `tar` are present;
+a pax archive unpacks; `LD_LIBRARY_PATH` is honoured; `faultlogger/` and
+`faultlog/temp/` are readable; an argument holding
+``it's "quoted" $HOME `id` ;|&*`` arrives byte for byte. hilog's proc
+column is **truncated** for a native program (`api_unit_te/<tag>`) and
+**absent** for system domains (`MUSL-LDSO`, `PARAM_WATCHER`), while
+`hilog -P <pid>` selects the program's records — hence the `pid`
+prefilter default and truncation-tolerant proc matching (harmony.md §6.5).
+
+Still unverified:
+
+- **Faultlogger readability** for a non-root shell user on user builds.
+
+### 8.7 Crash reports
+
+Two device directories are snapshotted before and after the run:
+
+| Directory | Written by | File |
+|-----------|-----------|------|
+| `/data/log/faultlog/faultlogger/` | hiview (published report) | `cppcrash-*.log` |
+| `/data/log/faultlog/temp/` | faultloggerd, at the moment of the crash | `cppcrash-<pid>-<timestamp>.json` (full stack) |
+
+Device-verified: after a SIGSEGV (exit 139) hiview published **no**
+faultlogger report (none >90 s later) while faultloggerd wrote the temp
+dump — whose `PNAME` was the exec path truncated to 128 bytes. The
+`./<basename>` exec (§8.4) and core's shorter staging path address the
+missing report; collecting the temp dump makes the crash evidence
+independent of hiview either way.
+
+`crash_collect(before, after, ctx?)` returns every new faultlogger report
+(its name does not reliably carry the pid) and new temp dumps. With
+`ctx = { pid = N }` — the pid `parse_pid` reported for the run — only
+temp dumps named `cppcrash-N-…` are returned; without it (core's current
+two-argument call) every new temp dump is, the snapshot diff already
+confining them to the run's window. A non-integer `pid` is ignored.
+
+### 8.8 Device description (`describe_device`)
+
+Optional builder giving core a human-readable device name (`hdc list
+targets -v` has none). One `hdc -t <serial> shell` call per **online**
+device prints `<param>=<value>` for `const.product.marketname`,
+`const.product.model` and `const.product.name`; `parse(lines)` keeps
+non-empty values that are not `param get` error text and returns
+
+```lua
+{ display_name = marketname or product_name or model,
+  properties = { market_name = …, model = …, product_name = … } }  -- present keys only
+```
+
+or `nil` when nothing usable came back (core then keeps the serial).
+
+`param get` of an unset parameter prints error text such as
+`get param: const.product.marketname fail! errNum is:106!` (wording
+varies). A value containing `fail!` or `errNum` (case-insensitive), or
+starting with `get param`, is error text; so is a bare output line with
+those markers, which marks every describe parameter it names as absent
+even if a value line for it was seen. Absent parameters are omitted from
+`properties`.
+
+Device-verified (Mate 60 Pro): `const.product.marketname` is **unset**
+(errNum 106), `const.product.name` = `HUAWEI Mate 60 Pro`,
+`const.product.model` = `ALN-AL00` — hence product name before model;
+the model code is only the last resort.

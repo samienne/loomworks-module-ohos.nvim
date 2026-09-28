@@ -30,6 +30,23 @@ local function resolve_tool(base, exts)
     return nil
 end
 
+--- Target-platform token per OHOS ABI (core §10.7 / §18.1; cmake module
+--- spec §15.1). This provider's own vocabulary: core only compares a
+--- kit's token for equality with the device runner's `platforms`.
+P.PLATFORM_TOKENS = {
+    ["arm64-v8a"] = "ohos-aarch64",
+    ["armeabi-v7a"] = "ohos-arm",
+}
+
+--- Per-arch token table for a platform's arch list.
+--- @param archs string[]
+--- @return table<string, string>
+local function platform_tokens(archs)
+    local t = {}
+    for _, arch in ipairs(archs) do t[arch] = P.PLATFORM_TOKENS[arch] end
+    return t
+end
+
 local exe_exts = is_win and { ".exe", "" } or { "", ".exe" }
 local script_exts = is_win and { ".bat", ".cmd", "" } or { "", ".sh" }
 
@@ -227,6 +244,7 @@ function P.query_capabilities(sdk, module_id)
                         "-DHMOS_SDK_NATIVE=" .. hmos_native,
                     }),
                 },
+                target_platform = platform_tokens({ "arm64-v8a" }),
             }
         end
         if uv.fs_stat(ohos_tc) then
@@ -244,6 +262,7 @@ function P.query_capabilities(sdk, module_id)
                         "-DOHOS_SDK_NATIVE=" .. ohos_native,
                     }),
                 },
+                target_platform = platform_tokens({ "arm64-v8a", "armeabi-v7a" }),
             }
         end
 
@@ -259,6 +278,33 @@ function P.query_capabilities(sdk, module_id)
     end
 
     return nil
+end
+
+--- Device runner for this installation (core §18.2; spec/sdks/ohos.md §8).
+--- The connector is the SDK's own hdc
+--- (`sdk/default/openharmony/toolchains/hdc[.exe]`) — never one found on
+--- PATH, never one from cached tool data (core §17.7). Returns nil when
+--- the installation ships no hdc.
+--- @param sdk loomworks.SDK
+--- @return table|nil Runner
+function P.device_runner(sdk)
+    local path = sdk and sdk:sdk_path()
+    if not path then return nil end
+    local hdc = resolve_tool(path .. "/sdk/default/openharmony/toolchains/hdc", exe_exts)
+    if not hdc then return nil end
+    local seen, platforms = {}, {}
+    for _, token in pairs(P.PLATFORM_TOKENS) do
+        if not seen[token] then
+            seen[token] = true
+            platforms[#platforms + 1] = token
+        end
+    end
+    table.sort(platforms)
+    return require("loomworks-module-ohos.runner").new({
+        hdc = hdc,
+        sdk_path = path,
+        platforms = platforms,
+    })
 end
 
 return P

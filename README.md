@@ -11,6 +11,11 @@ Ships:
 - `ohos` SDK provider — locates the OpenHarmony SDK and exposes its
   kits (sysroot, ndk, toolchain) to both the harmony module and
   cmake projects that want to cross-compile against the same SDK.
+  Also supplies the **device runner** loomworks uses to run native
+  executables from those cmake kits on an attached device (`lw run` /
+  `lw test` on a foreign build): staging over `hdc`, exit status,
+  crash-report collection and a filtered hilog stream. The connector is
+  always the SDK's own `hdc` (never one found on `PATH`).
 - `hvigor` build progress parser — recognises hvigor's progress lines
   and feeds them into the loomworks progress aggregator.
 
@@ -53,7 +58,20 @@ resolve automatically. No core changes required.
   contract (detection, configurations, build pipeline, device
   deployment, hilog streaming).
 - [`spec/sdks/ohos.md`](spec/sdks/ohos.md) — SDK provider contract
-  (detection paths, kit shape, cmake & harmony integration).
+  (detection paths, kit shape and target-platform tokens, cmake &
+  harmony integration, the device runner and its hilog log session).
+
+## Device log options
+
+Runs on a device accept hilog options, from a launch configuration's
+`device_log` table or `lw … --log key=value`:
+`show` (`stdout` | `hilog` | `both`), `prefilter` (`pid` | `strict` |
+`app-related` | `all`), `level` (`D`…`F`), `tag`, `proc`, `grep`,
+`exclude` (Lua patterns), `tail`. For a native executable the default is
+program output live and hilog — selected by the program's pid
+(`prefilter=pid`), level `W`, last 30 lines — printed only when the run
+fails; e.g. `lw run P Runner --log show=both --log level=D`. See
+[`spec/modules/harmony.md`](spec/modules/harmony.md) §6.5.
 
 ## Commands
 
