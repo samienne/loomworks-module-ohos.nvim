@@ -10,15 +10,16 @@
 --- send/recv are copies; hilog prints canned lines.
 ---
 --- Covered: device listing, staging (mkdir -p, push, chmod 755, sha256sum
---- verification, one ustar/pax archive unpacked with tar -xf), incremental
+--- verification, one ustar/pax archive unpacked with tar -xf then deleted
+--- behind an `.ok` marker; core's shortened §18.4 device root), incremental
 --- re-staging, the platform runtime file (libc++_shared.so), exec with an
 --- argument holding both quote kinds, env + loader path + cwd, pid and exit
 --- sentinels, unterminated last output, the log session (clear, hilog -P
 --- <program pid>, receive prefilter, display filter, device.log), the
 --- `--log` string form of numeric options (tail), gtest framework probe +
---- results XML pull, crash collection (a faultlogger cppcrash report AND a
+--- results XML pull (then removed with its empty directory), crash collection (a faultlogger cppcrash report AND a
 --- faultloggerd temp dump `faultlog/temp/cppcrash-<pid>-<ts>.json` for the
---- program's pid), the program exec'd as `./<basename>` from its directory,
+--- program's pid only, via crash_collect ctx.pid), the program exec'd as `./<basename>` from its directory,
 --- and hilog's proc-less system-domain records kept by the pid prefilter.
 ---
 --- Skipped unless: LOOMWORKS_PATH points at a core with remote execution
@@ -114,6 +115,9 @@ done
 if [ -n "$E2E_CRASH" ]; then
   : > "$FAKE_HDC_SHROOT/data/log/faultlog/faultlogger/cppcrash-prog-$$-20260928"
   echo '{"pid":'"$$"',"reason":"SIGSEGV"}' > "$FAKE_HDC_SHROOT/data/log/faultlog/temp/cppcrash-$$-1790000000000.json"
+  # Another process's dump in the same window: excluded via crash_collect's ctx.pid.
+  other=$(( $$ + 1 ))
+  echo '{"pid":'"$other"'}' > "$FAKE_HDC_SHROOT/data/log/faultlog/temp/cppcrash-$other-1790000000001.json"
 fi
 printf 'last line without newline'
 exit 3
@@ -131,6 +135,7 @@ describe("ohos device runner end-to-end (fake hdc, real core)", function()
     local test_run = require("loomworks.remote.test_run")
     local runners = require("loomworks.remote.runners")
     local ohos = require("loomworks.sdks.ohos")
+    local runner_mod = require("loomworks-module-ohos.runner")
 
     local tmp, sdk_dir, dev_root, build, calls_file, runner, saved_env
     local ENV_KEYS = { "FAKE_HDC_ROOT", "FAKE_HDC_SHROOT", "FAKE_HDC_SH", "FAKE_HDC_SERIAL",
@@ -246,7 +251,13 @@ describe("ohos device runner end-to-end (fake hdc, real core)", function()
         assert.equals(3, res.exit_code)
         assert.is_true(res.failed)
 
-        local droot = "/data/local/tmp/.device-staging/e2e_ws/build_App_Debug"
+        -- Device root derived the way core names it (§18.4: shortened
+        -- workspace + `<last id component>-<10 hex>` unit segments).
+        local _, droot = manifest.device_roots(runner_mod.STAGING_BASE, ws.name, "build/App/Debug")
+        assert.truthy(droot:match("^/data/local/tmp/%.device%-staging/e2e_ws/Debug%-%x+$"), droot)
+        -- ...and it is the one unit directory actually staged on the device.
+        local staged = vim.fn.glob(dev_root .. "/data/local/tmp/.device-staging/e2e_ws/*", false, true)
+        assert.same({ dev_root .. droot }, vim.tbl_map(function(x) return (x:gsub("\\", "/")) end, staged))
         local text = table.concat(out, "\n")
         -- cwd = the artifact's device directory (device path, as the device sees it)
         assert.truthy(text:find("cwd=" .. droot .. "/bin", 1, true), text)
@@ -282,8 +293,12 @@ describe("ohos device runner end-to-end (fake hdc, real core)", function()
         assert.equals("asset-data", read(host_root .. "/assets/deep/data.txt"))
         local long = "assets/" .. string.rep("very-long-directory-name/", 5) .. string.rep("n", 60) .. ".bin"
         assert.equals("long", read(host_root .. "/" .. long), "pax path record honoured by tar -xf")
-        local tars = vim.fn.glob(host_root .. "/.loomworks/archive-*.tar", false, true)
-        assert.equals(1, #tars, "archive kept under .loomworks/")
+        -- The archive is deleted after unpack; an `.ok` marker records it.
+        assert.same({}, vim.fn.glob(host_root .. "/.loomworks/archive-*.tar", false, true),
+            "archive removed after unpack")
+        local oks = vim.fn.glob(host_root .. "/.loomworks/archive-*.ok", false, true)
+        assert.equals(1, #oks, "unpack marker under .loomworks/")
+        assert.truthy(oks[1]:gsub("\\", "/"):match("/archive%-%x%x%x%x%x%x%x%x%x%x%x%x%.ok$"), oks[1])
 
         -- Housekeeping went through exec with POSIX utilities; the log
         -- stream followed the program's own pid.
@@ -370,8 +385,17 @@ describe("ohos device runner end-to-end (fake hdc, real core)", function()
         assert.equals(2, counts.total)
         assert.equals(1, counts.failed)
 
+        -- The pulled results file is removed from the device, and its
+        -- now-empty results directory with it.
+        local _, droot = manifest.device_roots(runner_mod.STAGING_BASE, ws.name, "build/App/Debug")
+        local results_dir = dev_root .. droot .. "/" .. test_run.RESULTS_REL
+        assert.is_nil(uv.fs_stat(results_dir .. "/" .. st.results_name), "results file cleared")
+        assert.is_nil(uv.fs_stat(results_dir), "empty results dir removed")
+        assert.truthy(uv.fs_stat(dev_root .. droot .. "/bin/prog"), "staged tree itself kept")
+
         -- Both the faultlogger report and the faultloggerd temp dump of the
-        -- program's pid; the pre-existing ones are not new.
+        -- program's pid (crash_collect gets ctx.pid, so another process's new
+        -- dump is excluded); the pre-existing ones are not new.
         assert.equals(2, #res.crashes, vim.inspect(res.crashes))
         local by = {}
         for _, c in ipairs(res.crashes) do by[c:match("[^/]+$")] = c end
