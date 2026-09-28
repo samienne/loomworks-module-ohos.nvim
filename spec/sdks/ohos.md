@@ -84,6 +84,14 @@ OpenHarmony, or both):
 }
 ```
 
+When the SDK's bundled ninja exists (`.../native/build-tools/cmake/bin/ninja`,
+next to the bundled cmake), every `arch_args` list also carries
+`-DCMAKE_MAKE_PROGRAM=<abs path to it>` so configure uses the SDK's
+cmake+ninja pairing rather than the first ninja on PATH. Core's cmake
+kits have no dedicated make-program field, so it rides in the extra args;
+core appends user configuration options after kit args, so a user-set
+`CMAKE_MAKE_PROGRAM` still wins. Without a bundled ninja no pin is emitted.
+
 `clangd_required = true` because the SDK-bundled clangd knows
 platform headers that stock PATH-clangd cannot locate. Falling back
 would silently produce wrong index data.

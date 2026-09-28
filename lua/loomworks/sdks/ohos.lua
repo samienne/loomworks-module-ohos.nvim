@@ -197,6 +197,22 @@ function P.query_capabilities(sdk, module_id)
         -- headers that stock PATH-clangd cannot locate.
         local cmake_path = resolve_tool(ohos_native .. "/build-tools/cmake/bin/cmake", exe_exts)
         local clangd_path = resolve_tool(ohos_native .. "/llvm/bin/clangd", exe_exts)
+        -- Pin the SDK's bundled ninja (it ships next to the bundled cmake)
+        -- so configure uses the SDK's cmake+ninja pairing rather than
+        -- whatever ninja happens to be first on PATH. Core's cmake
+        -- kits_from_sdk has no dedicated make-program field, so this rides
+        -- in each arch's extra args; core appends user options after kit
+        -- args, so a user-set CMAKE_MAKE_PROGRAM still wins. Absent bundled
+        -- ninja → no pin (CMake falls back to PATH, as before).
+        local ninja_path = resolve_tool(ohos_native .. "/build-tools/cmake/bin/ninja", exe_exts)
+        local common_args = {}
+        if ninja_path then
+            common_args[#common_args + 1] = "-DCMAKE_MAKE_PROGRAM=" .. ninja_path
+        end
+        local function with_common(args)
+            vim.list_extend(args, common_args)
+            return args
+        end
 
         local platforms = {}
         if uv.fs_stat(hmos_tc) then
@@ -205,11 +221,11 @@ function P.query_capabilities(sdk, module_id)
                 toolchain_file = hmos_tc,
                 archs = { "arm64-v8a" },
                 arch_args = {
-                    ["arm64-v8a"] = {
+                    ["arm64-v8a"] = with_common({
                         "-DOHOS_ARCH=arm64-v8a",
                         "-DOHOS_SDK_NATIVE=" .. ohos_native,
                         "-DHMOS_SDK_NATIVE=" .. hmos_native,
-                    },
+                    }),
                 },
             }
         end
@@ -219,14 +235,14 @@ function P.query_capabilities(sdk, module_id)
                 toolchain_file = ohos_tc,
                 archs = { "arm64-v8a", "armeabi-v7a" },
                 arch_args = {
-                    ["arm64-v8a"] = {
+                    ["arm64-v8a"] = with_common({
                         "-DOHOS_ARCH=arm64-v8a",
                         "-DOHOS_SDK_NATIVE=" .. ohos_native,
-                    },
-                    ["armeabi-v7a"] = {
+                    }),
+                    ["armeabi-v7a"] = with_common({
                         "-DOHOS_ARCH=armeabi-v7a",
                         "-DOHOS_SDK_NATIVE=" .. ohos_native,
-                    },
+                    }),
                 },
             }
         end
