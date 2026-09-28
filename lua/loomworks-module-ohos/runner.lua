@@ -11,6 +11,7 @@
 --- `:`. See spec/sdks/ohos.md §8 for the contract as implemented here.
 
 local hdc = require("loomworks-module-ohos.hdc")
+local hilog = require("loomworks-module-ohos.hilog")
 
 local M = {}
 
@@ -132,6 +133,74 @@ function M.parse_pid(line, nonce)
     return pid and tonumber(pid) or nil
 end
 
+--- Build the log Session (core §18.13) for one run.
+---
+---   clear      `hdc -t S shell hilog -r` — flush the buffer so the run's
+---              log starts clean (best-effort, core ignores failure).
+---   stream(p)  `hdc -t S shell hilog -P <p>` — ONLY `-P`: no `-L` (it
+---              suppresses some native log paths), no `-t`/`-T` (native
+---              OH_LOG_Print lands on type `core`; tags are filtered
+---              client-side). hilog first replays the pid's buffered
+---              records, then follows. Without a pid: plain `hilog`.
+---   receive    sanitize → parse → session prefilter (mode `prefilter`,
+---              the pid given to `stream`, the program name as proc).
+---              Unparseable lines are kept raw.
+---   display    parse → soft filter (level/tag/proc/grep/exclude) →
+---              compact rendering; nil when filtered out.
+---   show       show policy from the `show` option.
+--- @param spec fun(args: string[]): table spec builder bound to hdc
+--- @param serial string
+--- @param options table|nil
+--- @param program { path: string, name: string }|nil
+--- @return table|nil session, string|nil err
+function M.log_session(spec, serial, options, program)
+    local o, err = hilog.resolve_options(options, "native")
+    if not o then return nil, err end
+
+    local name = program and program.name
+    local filter = hilog.filter_from_options(o)
+    local prefilter = hilog.make_prefilter({ mode = o.prefilter, name = name })
+
+    local S = {
+        clear = spec(hdc.shell_argv(serial, "hilog -r")),
+        show = o.show_policy,
+        options = o,
+    }
+
+    function S.stream(pid)
+        pid = tonumber(pid)
+        if pid and (pid < 1 or pid ~= math.floor(pid)) then pid = nil end
+        prefilter = hilog.make_prefilter({ mode = o.prefilter, pid = pid, name = name })
+        if pid then
+            return spec(hdc.shell_argv(serial, string.format("hilog -P %d", pid)))
+        end
+        return spec(hdc.shell_argv(serial, "hilog"))
+    end
+
+    function S.receive(line)
+        local clean = hilog.sanitize(line)
+        if clean == "" then return nil end
+        local record = hilog.parse_line(clean)
+        if not record then return clean end
+        if prefilter(record) then return clean end
+        return nil
+    end
+
+    function S.display(line)
+        local record, clean = hilog.parse_line(line)
+        if not record then
+            if not clean or clean == "" then return nil end
+            if hilog.match_filter(filter, { raw = clean }, clean) then return clean end
+            return nil
+        end
+        local rendered = hilog.render(record, "compact")
+        if hilog.match_filter(filter, record, rendered) then return rendered end
+        return nil
+    end
+
+    return S
+end
+
 --- Construct a runner.
 --- @param opts { hdc: string, sdk_path?: string, platforms: string[], win?: boolean }
 --- @return table Runner (core §18.2)
@@ -240,6 +309,15 @@ function M.new(opts)
             .. triple .. "/libc++_shared.so"
         if not (vim.uv or vim.loop).fs_stat(path) then return {} end
         return { { ["local"] = path, relative = "libc++_shared.so" } }
+    end
+
+    --- Runner log stream for one run (core §18.13): hilog for the
+    --- program's pid. `options` is the merged `device_log` / `--log` map
+    --- (hilog.lua vocabulary, native-executable defaults); `program` is
+    --- `{ path, name }` of the staged program.
+    --- @return table|nil Session, string|nil err
+    function R.log_session(serial, options, program)
+        return M.log_session(spec, serial, options, program)
     end
 
     return R

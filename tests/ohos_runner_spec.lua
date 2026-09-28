@@ -53,7 +53,7 @@ describe("ohos runner identity", function()
         assert.is_nil(r.timeouts)
         for _, b in ipairs({ "list_devices", "parse_devices", "push", "pull", "exec",
             "parse_exit", "parse_pid", "terminate", "crash_snapshot", "crash_collect",
-            "runtime_files" }) do
+            "runtime_files", "log_session" }) do
             assert.is_function(r[b], b)
         end
     end)
