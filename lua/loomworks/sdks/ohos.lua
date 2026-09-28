@@ -280,4 +280,31 @@ function P.query_capabilities(sdk, module_id)
     return nil
 end
 
+--- Device runner for this installation (core §18.2; spec/sdks/ohos.md §8).
+--- The connector is the SDK's own hdc
+--- (`sdk/default/openharmony/toolchains/hdc[.exe]`) — never one found on
+--- PATH, never one from cached tool data (core §17.7). Returns nil when
+--- the installation ships no hdc.
+--- @param sdk loomworks.SDK
+--- @return table|nil Runner
+function P.device_runner(sdk)
+    local path = sdk and sdk:sdk_path()
+    if not path then return nil end
+    local hdc = resolve_tool(path .. "/sdk/default/openharmony/toolchains/hdc", exe_exts)
+    if not hdc then return nil end
+    local seen, platforms = {}, {}
+    for _, token in pairs(P.PLATFORM_TOKENS) do
+        if not seen[token] then
+            seen[token] = true
+            platforms[#platforms + 1] = token
+        end
+    end
+    table.sort(platforms)
+    return require("loomworks-module-ohos.runner").new({
+        hdc = hdc,
+        sdk_path = path,
+        platforms = platforms,
+    })
+end
+
 return P

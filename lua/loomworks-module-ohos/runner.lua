@@ -1,0 +1,248 @@
+--- loomworks-module-ohos/runner.lua — the ohos device runner (core §18.2).
+---
+--- Runs plain native executables built by the ohos SDK's cmake kits on an
+--- attached HarmonyOS/OpenHarmony device through `hdc`. Like every device
+--- runner it only BUILDS command specs and PARSES output: core spawns every
+--- process, owns timeouts, cancellation, line normalization and locking.
+---
+--- Returned by the ohos SDK provider's `device_runner(sdk)` hook
+--- (`lua/loomworks/sdks/ohos.lua`). The builders are plain functions
+--- (closures over the hdc path), called as `runner.push(...)`, never with
+--- `:`. See spec/sdks/ohos.md §8 for the contract as implemented here.
+
+local hdc = require("loomworks-module-ohos.hdc")
+
+local M = {}
+
+--- Device-side directory under which core stages files (core §18.4).
+M.STAGING_BASE = "/data/local/tmp/.device-staging"
+
+--- Where the device writes native crash reports (faultlogger).
+M.FAULTLOG_DIR = "/data/log/faultlog/faultlogger"
+
+--- OHOS ABI → LLVM target triple (the per-arch lib dir under the
+--- SDK's `native/llvm/lib/`).
+M.ARCH_TRIPLE = {
+    ["arm64-v8a"] = "aarch64-linux-ohos",
+    ["armeabi-v7a"] = "arm-linux-ohos",
+    ["x86_64"] = "x86_64-linux-ohos",
+}
+
+--- Sentinel line prefixes. The nonce is appended and is alphanumeric,
+--- so the lines need no quoting on the device.
+local EXIT_TAG = "__LW_EXIT_"
+local PID_TAG = "__LW_PID_"
+
+local function check_nonce(nonce)
+    if type(nonce) ~= "string" or not nonce:match("^%w+$") then
+        error("ohos runner: nonce must be alphanumeric", 3)
+    end
+end
+
+--- Render the device-side shell script for an exec request (core §18.2).
+---
+---   cd '<cwd>' || { echo __LW_EXIT_<n>=126; exit 126; };
+---   K='V' ... LD_LIBRARY_PATH='<d1>:<d2>'"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+---     sh -c 'echo __LW_PID_<n>=$$; exec "$0" "$@"' '<argv1>' '<argv2>' ...;
+---   echo __LW_EXIT_<n>=$?
+---
+--- The inner `sh -c ... exec` makes the announced pid the program's own
+--- (exec keeps the pid) while the outer shell survives to print the exit
+--- sentinel. Env NAMES are emitted unquoted — a quoted name is not an
+--- assignment — which is safe because they are checked to be portable
+--- identifiers (core refuses anything else before calling us; we check
+--- again). Every value and argument is single-quoted (`hdc.quote`).
+--- @param request { argv: string[], cwd: string, env?: table<string,string>, library_dirs?: string[], nonce: string }
+--- @return string script ONE device command line
+function M.render_exec_script(request)
+    check_nonce(request.nonce)
+    local argv = request.argv or {}
+    if #argv == 0 then error("ohos runner: exec request has an empty argv", 2) end
+    if type(request.cwd) ~= "string" or request.cwd == "" then
+        error("ohos runner: exec request has no cwd", 2)
+    end
+    local n = request.nonce
+
+    local assigns = {}
+    local env = request.env or {}
+    local names = vim.tbl_keys(env)
+    table.sort(names)
+    for _, name in ipairs(names) do
+        if type(name) ~= "string" or not name:match("^[A-Za-z_][A-Za-z0-9_]*$") then
+            error("ohos runner: invalid environment name " .. vim.inspect(name), 2)
+        end
+        if name ~= "LD_LIBRARY_PATH" then
+            assigns[#assigns + 1] = name .. "=" .. hdc.quote(tostring(env[name]))
+        end
+    end
+    local dirs = request.library_dirs or {}
+    if #dirs > 0 then
+        for _, d in ipairs(dirs) do
+            if d:find(":", 1, true) then
+                error("ohos runner: library dir contains ':' (loader path separator): " .. d, 2)
+            end
+        end
+        -- The manifest's library dirs are the loader path (core §18.9);
+        -- keep whatever the device already had after them.
+        assigns[#assigns + 1] = "LD_LIBRARY_PATH=" .. hdc.quote(table.concat(dirs, ":"))
+            .. '"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+    end
+
+    local inner = "echo " .. PID_TAG .. n .. "=$$; exec \"$0\" \"$@\""
+    local run = {}
+    if #assigns > 0 then run[#run + 1] = table.concat(assigns, " ") end
+    run[#run + 1] = "sh -c " .. hdc.quote(inner)
+    run[#run + 1] = hdc.join(argv)
+
+    return table.concat({
+        "cd " .. hdc.quote(request.cwd) .. " || { echo " .. EXIT_TAG .. n .. "=126; exit 126; }",
+        table.concat(run, " "),
+        "echo " .. EXIT_TAG .. n .. "=$?",
+    }, "; ")
+end
+
+--- Recognise the exit sentinel for `nonce`.
+---
+--- The sentinel is matched at the END of the line: a program whose last
+--- output lacks a trailing newline makes the device print
+--- `<partial output>__LW_EXIT_<n>=<status>` on one line. The second
+--- return value is that preceding program text (nil when the line is
+--- the bare sentinel) so a caller can keep it as program output. A line
+--- without this nonce is never a sentinel.
+--- @param line string
+--- @param nonce string
+--- @return integer|nil status, string|nil preceding_output
+function M.parse_exit(line, nonce)
+    if type(line) ~= "string" or type(nonce) ~= "string" then return nil end
+    line = hdc.normalize_line(line)
+    local pre, st = line:match("^(.-)" .. vim.pesc(EXIT_TAG .. nonce) .. "=(%d+)$")
+    if not st then return nil end
+    return tonumber(st), (pre ~= "" and pre or nil)
+end
+
+--- Recognise the process-id line for `nonce` (printed before the program
+--- produces any output, so it is always a whole line).
+--- @param line string
+--- @param nonce string
+--- @return integer|nil
+function M.parse_pid(line, nonce)
+    if type(line) ~= "string" or type(nonce) ~= "string" then return nil end
+    line = hdc.normalize_line(line)
+    local pid = line:match("^" .. vim.pesc(PID_TAG .. nonce) .. "=(%d+)$")
+    return pid and tonumber(pid) or nil
+end
+
+--- Construct a runner.
+--- @param opts { hdc: string, sdk_path?: string, platforms: string[], win?: boolean }
+--- @return table Runner (core §18.2)
+function M.new(opts)
+    assert(opts and opts.hdc, "ohos runner: hdc path required")
+    local hdc_path = opts.hdc
+    local win = opts.win
+
+    local function spec(args, check)
+        return { cmd = hdc_path, args = args, check_output = check }
+    end
+
+    local R = {
+        id = "ohos",
+        platforms = opts.platforms or {},
+        staging_base = M.STAGING_BASE,
+        archive = true,
+        -- Device-side argv prefix printing `<hex>  <path>` per file.
+        -- VERIFY on device: toybox `sha256sum` on HarmonyOS NEXT. If it
+        -- is missing the command fails, no digests come back and core
+        -- simply re-stages (safe, only slower). md5sum is deliberately
+        -- NOT used as an automatic fallback: the device digest must be
+        -- the same algorithm core records on the host.
+        digest = { "sha256sum" },
+        -- `hdc shell` merges the program's stderr into stdout (verified).
+        combined_output = true,
+        -- Core defaults (query 120 s, transfer 600 s) are used.
+        timeouts = nil,
+    }
+
+    function R.list_devices()
+        return spec(hdc.argv(nil, "list", "targets", "-v"))
+    end
+
+    R.parse_devices = hdc.parse_targets
+
+    function R.push(serial, local_path, remote)
+        return spec(hdc.argv(serial, "file", "send",
+            hdc.local_path(local_path, win), remote), hdc.check_output)
+    end
+
+    function R.pull(serial, remote, local_path)
+        return spec(hdc.argv(serial, "file", "recv",
+            remote, hdc.local_path(local_path, win)), hdc.check_output)
+    end
+
+    function R.exec(serial, request)
+        return spec(hdc.shell_argv(serial, M.render_exec_script(request)),
+            hdc.check_output)
+    end
+
+    R.parse_exit = M.parse_exit
+    R.parse_pid = M.parse_pid
+
+    --- Stop the program started with `nonce`. Only a pid reported by
+    --- `parse_pid` is used; without one nothing is sent (nil).
+    function R.terminate(serial, nonce, pid)
+        pid = tonumber(pid)
+        if not pid or pid < 1 or pid ~= math.floor(pid) then return nil end
+        local p = string.format("%d", pid)
+        return spec(hdc.shell_argv(serial,
+            "kill " .. p .. " 2>/dev/null; sleep 1; kill -9 " .. p .. " 2>/dev/null"))
+    end
+
+    --- Snapshot of existing native crash reports: returns the spec and a
+    --- parser turning its output into a set of `cppcrash-*` names.
+    function R.crash_snapshot(serial)
+        local s = spec(hdc.shell_words(serial, { "ls", "-1", M.FAULTLOG_DIR .. "/" }))
+        local function parse(lines)
+            local set = {}
+            for _, raw in ipairs(lines or {}) do
+                for word in hdc.normalize_line(raw):gmatch("%S+") do
+                    local name = word:match("([^/]+)$")
+                    if name and name:match("^cppcrash%-") then set[name] = true end
+                end
+            end
+            return set
+        end
+        return s, parse
+    end
+
+    --- Remote paths of crash reports present in `after` but not `before`.
+    function R.crash_collect(before, after)
+        local out = {}
+        for name in pairs(after or {}) do
+            if not (before or {})[name] then
+                out[#out + 1] = M.FAULTLOG_DIR .. "/" .. name
+            end
+        end
+        table.sort(out)
+        return out
+    end
+
+    --- Platform runtime files a program built by `tool` needs beside it:
+    --- the shared C++ runtime from the SDK's native sysroot, staged
+    --- UNCONDITIONALLY (0.9 MB; harmless for a static-STL program — the
+    --- runner sees only the tool, not the configuration's OHOS_STL).
+    --- @param tool table loomworks.Tool (uses `.data`) or raw tool_data
+    --- @return { local: string, relative: string }[]
+    function R.runtime_files(tool)
+        if not opts.sdk_path or not tool then return {} end
+        local data = tool.data or tool
+        local triple = data.arch and M.ARCH_TRIPLE[data.arch]
+        if not triple then return {} end
+        local path = opts.sdk_path .. "/sdk/default/openharmony/native/llvm/lib/"
+            .. triple .. "/libc++_shared.so"
+        if not (vim.uv or vim.loop).fs_stat(path) then return {} end
+        return { { ["local"] = path, relative = "libc++_shared.so" } }
+    end
+
+    return R
+end
+
+return M
