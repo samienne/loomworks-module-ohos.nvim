@@ -16,7 +16,10 @@
 --- sentinels, unterminated last output, the log session (clear, hilog -P
 --- <program pid>, receive prefilter, display filter, device.log), the
 --- `--log` string form of numeric options (tail), gtest framework probe +
---- results XML pull, and crash collection (a cppcrash file appearing).
+--- results XML pull, crash collection (a faultlogger cppcrash report AND a
+--- faultloggerd temp dump `faultlog/temp/cppcrash-<pid>-<ts>.json` for the
+--- program's pid), the program exec'd as `./<basename>` from its directory,
+--- and hilog's proc-less system-domain records kept by the pid prefilter.
 ---
 --- Skipped unless: LOOMWORKS_PATH points at a core with remote execution
 --- (`loomworks.remote.run`), `luvi` is on PATH, and a POSIX sh is found.
@@ -82,6 +85,7 @@ for a in "$@"; do
   esac
 done
 echo "self=$$"
+echo "argv0=$0"
 echo "cwd=$(pwd)"
 for a in "$@"; do printf 'arg=[%s]\n' "$a"; done
 echo "env=$E2E_VAR"
@@ -109,6 +113,7 @@ XML
 done
 if [ -n "$E2E_CRASH" ]; then
   : > "$FAKE_HDC_SHROOT/data/log/faultlog/faultlogger/cppcrash-prog-$$-20260928"
+  echo '{"pid":'"$$"',"reason":"SIGSEGV"}' > "$FAKE_HDC_SHROOT/data/log/faultlog/temp/cppcrash-$$-1790000000000.json"
 fi
 printf 'last line without newline'
 exit 3
@@ -192,6 +197,7 @@ describe("ohos device runner end-to-end (fake hdc, real core)", function()
         vim.fn.mkdir(dev_root .. "/data/local/tmp", "p")
         vim.fn.mkdir(dev_root .. "/data/log/faultlog/faultlogger", "p")
         write(dev_root .. "/data/log/faultlog/faultlogger/cppcrash-old-1-1", "old crash")
+        write(dev_root .. "/data/log/faultlog/temp/cppcrash-1-1.json", "old dump")
 
         -- Build tree: program, a derived shared library, an archive set with a
         -- path too long for plain ustar (pax record).
@@ -204,6 +210,7 @@ describe("ohos device runner end-to-end (fake hdc, real core)", function()
         write(tmp .. "/hilog.txt", table.concat({
             "09-28 12:00:00.100  {PID}  {PID} I C01234/prog/E2E: program started",
             "09-28 12:00:00.200  {PID}  {PID} D C01234/prog/E2E: debug detail",
+            "09-28 12:00:00.250  {PID}  {PID} I C03F00/MUSL-LDSO: load /data/x/libfoo.so: ok",
             "09-28 12:00:00.300  999  999 E C05555/other/Noise: unrelated process",
             "09-28 12:00:00.400  {PID}  {PID} E C01234/prog/E2E: something failed",
         }, "\n") .. "\n")
@@ -243,6 +250,15 @@ describe("ohos device runner end-to-end (fake hdc, real core)", function()
         local text = table.concat(out, "\n")
         -- cwd = the artifact's device directory (device path, as the device sees it)
         assert.truthy(text:find("cwd=" .. droot .. "/bin", 1, true), text)
+        -- exec'd as ./<basename> from its own directory (short faultlog
+        -- PNAME). Checked on the command hdc received: `$0` of a shebang
+        -- script is resolved to a full path by some hosts' sh (MSYS).
+        local exec_calls = vim.tbl_filter(function(l) return l:find("__LW_PID_", 1, true) ~= nil
+            and l:find("cd " .. droot .. "/bin ||", 1, true) ~= nil end, calls())
+        assert.truthy(#exec_calls > 0, table.concat(calls(), "\n"))
+        for _, l in ipairs(exec_calls) do
+            assert.truthy(l:find("\"$@\"' ./prog", 1, true), l)
+        end
         -- every argument byte-for-byte, the empty one included
         assert.truthy(text:find("arg=[plain]", 1, true), text)
         assert.truthy(text:find("arg=[" .. tricky .. "]", 1, true), text)
@@ -280,10 +296,12 @@ describe("ohos device runner end-to-end (fake hdc, real core)", function()
         assert.truthy(c:find("shell | hilog -P " .. self_pid, 1, true),
             "hilog -P follows the pid announced before the program ran (" .. tostring(self_pid) .. ")")
 
-        -- Log session: receive prefilter (app-related) dropped the other
-        -- process; display (show=both, level I) printed live; tail as a string.
+        -- Log session: receive prefilter (pid) dropped the other process but
+        -- kept the pid's proc-less system-domain record; display (show=both,
+        -- level I) printed live; tail as a string.
         local dlog = read(res.run_dir .. "/device.log")
         assert.truthy(dlog:find("program started", 1, true), dlog)
+        assert.truthy(dlog:find("MUSL-LDSO: load /data/x/libfoo.so: ok", 1, true), dlog)
         assert.truthy(dlog:find("debug detail", 1, true), "kept lines are saved unfiltered by display")
         assert.falsy(dlog:find("unrelated process", 1, true))
         local shown = table.concat(err, "\n")
@@ -352,8 +370,18 @@ describe("ohos device runner end-to-end (fake hdc, real core)", function()
         assert.equals(2, counts.total)
         assert.equals(1, counts.failed)
 
-        assert.equals(1, #res.crashes, vim.inspect(res.crashes))
-        assert.truthy(res.crashes[1]:match("/crash/cppcrash%-prog%-%d+%-20260928$"), res.crashes[1])
+        -- Both the faultlogger report and the faultloggerd temp dump of the
+        -- program's pid; the pre-existing ones are not new.
+        assert.equals(2, #res.crashes, vim.inspect(res.crashes))
+        local by = {}
+        for _, c in ipairs(res.crashes) do by[c:match("[^/]+$")] = c end
+        local report = vim.tbl_filter(function(n) return n:match("^cppcrash%-prog%-%d+%-20260928$") end,
+            vim.tbl_keys(by))[1]
+        assert.is_string(report, vim.inspect(res.crashes))
+        local pid = report:match("^cppcrash%-prog%-(%d+)%-")
+        local dump = by["cppcrash-" .. pid .. "-1790000000000.json"]
+        assert.is_string(dump, "temp dump for the program's pid collected: " .. vim.inspect(res.crashes))
+        assert.truthy(read(dump):find('"pid":' .. pid, 1, true))
         assert.is_true(res.failed)
     end)
 end)

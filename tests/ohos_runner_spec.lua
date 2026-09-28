@@ -53,7 +53,7 @@ describe("ohos runner identity", function()
         assert.is_nil(r.timeouts)
         for _, b in ipairs({ "list_devices", "parse_devices", "push", "pull", "exec",
             "parse_exit", "parse_pid", "terminate", "crash_snapshot", "crash_collect",
-            "runtime_files", "log_session" }) do
+            "describe_device", "runtime_files", "log_session" }) do
             assert.is_function(r[b], b)
         end
     end)
@@ -95,6 +95,37 @@ describe("ohos runner specs (fake executor)", function()
         assert.is_function(r.exec("S", { argv = { "/d/p" }, cwd = "/d", nonce = "n1" }).check_output)
     end)
 
+    -- Exact shapes from a real hdc (host exit code 0 in every case).
+    local REAL_FAILS = {
+        "[Fail]Error opening file: no such file or directory, path:/data/local/tmp/x/results.xml",
+        "[Fail]Not match target founded, check connect-key please",
+        "[Fail]ExecuteCommand need connect-key? please confirm a device by help info",
+    }
+
+    it("every builder's check catches the real hdc [Fail] shapes (CRLF too)", function()
+        local r = new_runner()
+        local specs = {
+            r.push("S", "/b/x", "/d/x"), r.pull("S", "/d/x", "/b/x"),
+            r.exec("S", { argv = { "/d/p" }, cwd = "/d", nonce = "n1" }),
+            (r.crash_snapshot("S")), (r.describe_device("S")),
+        }
+        for _, sp in ipairs(specs) do
+            for _, line in ipairs(REAL_FAILS) do
+                local err = sp.check_output({ line .. "\r" })
+                assert.equals((line:gsub("^%[Fail%]", "")), err)
+            end
+        end
+    end)
+
+    it("exec's check ignores device-side error text (merged, unordered stderr)", function()
+        -- `hdc shell` merges device stderr into stdout without ordering:
+        -- a program's `error: ...` can land before the pid line or after
+        -- the sentinel, where core runs the check. It is not a connector failure.
+        local check = new_runner().exec("S", { argv = { "/d/p" }, cwd = "/d", nonce = "n1" }).check_output
+        assert.is_nil(check({ "error: config file missing", "sh: cd: x: No such file or directory" }))
+        assert.is_nil(check({}))
+    end)
+
     it("exec renders the device command as ONE argv element after shell", function()
         local r = new_runner()
         local s = r.exec("S1", { argv = { "/d/p", "a b" }, cwd = "/d", env = {}, library_dirs = {}, nonce = "abc123" })
@@ -130,9 +161,27 @@ describe("ohos runner exec script", function()
         assert.equals(table.concat({
             "cd /d/app || { echo __LW_EXIT_N0nce=126; exit 126; }",
             "ALPHA='it'\\''s' ZED=z LD_LIBRARY_PATH=/d/app:/d/app/plugins\"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\" "
-                .. "sh -c 'echo __LW_PID_N0nce=$$; exec \"$0\" \"$@\"' /d/app/prog '--gtest_filter=A.*'",
+                .. "sh -c 'echo __LW_PID_N0nce=$$; exec \"$0\" \"$@\"' ./prog '--gtest_filter=A.*'",
             "echo __LW_EXIT_N0nce=$?",
         }, "; "), s)
+    end)
+
+    it("execs a program living in cwd as ./<basename> (short faultlog PNAME)", function()
+        local ep = runner_mod.exec_program
+        assert.equals("./prog", ep("/d/app/prog", "/d/app"))
+        assert.equals("./prog", ep("/d/app/prog", "/d/app/"))
+        assert.equals("./x", ep("/x", "/"))
+        assert.equals("/d/app/bin/prog", ep("/d/app/bin/prog", "/d/app"))
+        assert.equals("/d/other/prog", ep("/d/other/prog", "/d/app"))
+        assert.equals("/d/app/prog", ep("/d/app/prog", nil))
+        assert.equals("mkdir", ep("mkdir", "/"))
+        assert.equals("sub/prog", ep("sub/prog", "/d"))
+        local s = render({ argv = { "/data/local/tmp/.device-staging/ws/u/test/unittest/api_unit_tests", "a" },
+            cwd = "/data/local/tmp/.device-staging/ws/u/test/unittest", nonce = "n" })
+        assert.truthy(s:find("\"$@\"' ./api_unit_tests a; ", 1, true), s)
+        -- elsewhere: the absolute path is kept
+        local s2 = render({ argv = { "/d/bin/prog" }, cwd = "/d", nonce = "n" })
+        assert.truthy(s2:find("' /d/bin/prog; ", 1, true), s2)
     end)
 
     it("housekeeping requests: no cwd / env / library_dirs emits no cd", function()
@@ -186,6 +235,7 @@ describe("ohos runner exec script", function()
         f:write(table.concat({
             "#!/bin/sh",
             'echo "self=$$"',
+            'echo "argv0=$0"',
             'echo "cwd=$(pwd)"',
             'echo "env=$MYVAR"',
             'echo "ld=$LD_LIBRARY_PATH"',
@@ -218,11 +268,15 @@ describe("ohos runner exec script", function()
         local pid = runner_mod.parse_pid(out[1], "T3st")
         assert.is_number(pid, "first line is the pid line: " .. tostring(out[1]))
         assert.equals("self=" .. pid, out[2], "announced pid is the program's own")
-        assert.is_truthy(out[3]:find("dir with space", 1, true), out[3])
-        assert.equals("env=v a l'ue $x", out[4])
-        assert.equals("ld=" .. sh_dir .. "/lib", out[5])
+        -- exec'd as ./prog from its cwd (the script says so; $0 of a shebang
+        -- script is not portable evidence — MSYS resolves it to a full path)
+        assert.truthy(script:find("\"$@\"' ./prog ", 1, true), script)
+        assert.truthy(out[3]:match("^argv0=.*prog$"), out[3])
+        assert.is_truthy(out[4]:find("dir with space", 1, true), out[4])
+        assert.equals("env=v a l'ue $x", out[5])
+        assert.equals("ld=" .. sh_dir .. "/lib", out[6])
         for i, a in ipairs(args) do
-            assert.equals("arg=[" .. a .. "]", out[5 + i])
+            assert.equals("arg=[" .. a .. "]", out[6 + i])
         end
         local joined = table.concat(out, "\n")
         assert.equals(3, runner_mod.parse_exit(out[#out], "T3st"))
@@ -269,26 +323,86 @@ describe("ohos runner sentinel parsing", function()
 end)
 
 describe("ohos runner crash reports", function()
-    it("snapshots cppcrash-* names and diffs before/after", function()
+    local FL = "/data/log/faultlog/faultlogger/"
+    local TMP = "/data/log/faultlog/temp/"
+
+    it("snapshots both crash dirs as full paths", function()
         local r = new_runner()
         local s, parse = r.crash_snapshot("S1")
-        assert.same({ "-t", "S1", "shell", "ls -1 /data/log/faultlog/faultlogger/" }, s.args)
-        local before = parse({ "cppcrash-foo-20000-1\r", "appfreeze-x", "syswarning-1", "" })
-        assert.same({ ["cppcrash-foo-20000-1"] = true }, before)
-        local after = parse({
-            "cppcrash-foo-20000-1", "cppcrash-LumeSceneAPITestRunner-20010-20260928",
-            "cppcrash-b-1  cppcrash-a-2",   -- multi-column ls output is tolerated
+        assert.same({ "-t", "S1", "shell", "for f in /data/log/faultlog/faultlogger/cppcrash-* "
+            .. "/data/log/faultlog/temp/cppcrash-*; do [ -e \"$f\" ] && echo \"$f\"; done" }, s.args)
+        local set = parse({
+            FL .. "cppcrash-foo-20000-1\r", FL .. "appfreeze-x-1", TMP .. "cppcrash-4242-1790000000000.json",
+            TMP .. "sub/cppcrash-1-1", "/data/elsewhere/cppcrash-1-1", "cppcrash-bare-1", "",
+            "[Fail]ExecuteCommand need connect-key? please confirm a device by help info",
         })
         assert.same({
-            "/data/log/faultlog/faultlogger/cppcrash-LumeSceneAPITestRunner-20010-20260928",
-            "/data/log/faultlog/faultlogger/cppcrash-a-2",
-            "/data/log/faultlog/faultlogger/cppcrash-b-1",
+            [FL .. "cppcrash-foo-20000-1"] = true,
+            [TMP .. "cppcrash-4242-1790000000000.json"] = true,
+        }, set)
+    end)
+
+    it("the listing command runs under a real sh (empty dirs print nothing)", function()
+        if vim.fn.executable("sh") ~= 1 then
+            pending("no sh on PATH")
+            return
+        end
+        local out = vim.fn.systemlist({ "sh", "-c", runner_mod.crash_list_command() })
+        assert.same({}, runner_mod.parse_crash_list(out))
+    end)
+
+    it("collects new faultlogger reports and the temp dump of the run's pid", function()
+        local r = new_runner()
+        local before = { [FL .. "cppcrash-old-1-1"] = true, [TMP .. "cppcrash-77-1.json"] = true }
+        local after = {
+            [FL .. "cppcrash-old-1-1"] = true, [TMP .. "cppcrash-77-1.json"] = true,
+            [FL .. "cppcrash-api_unit_te-0-20260928"] = true,
+            [TMP .. "cppcrash-4242-1790000000000.json"] = true,
+            [TMP .. "cppcrash-5555-1790000000001.json"] = true,   -- another process
+        }
+        assert.same({
+            FL .. "cppcrash-api_unit_te-0-20260928",
+            TMP .. "cppcrash-4242-1790000000000.json",
+        }, r.crash_collect(before, after, { pid = 4242 }))
+        -- Without the pid (core's current 2-argument call) every new temp dump.
+        assert.same({
+            FL .. "cppcrash-api_unit_te-0-20260928",
+            TMP .. "cppcrash-4242-1790000000000.json",
+            TMP .. "cppcrash-5555-1790000000001.json",
         }, r.crash_collect(before, after))
+        assert.same(r.crash_collect(before, after), r.crash_collect(before, after, { pid = "x" }))
+        assert.same({}, r.crash_collect(after, after, { pid = 4242 }))
     end)
 
     it("treats a permission error as an empty snapshot", function()
         local _, parse = new_runner().crash_snapshot("S1")
         assert.same({}, parse({ "ls: /data/log/faultlog/faultlogger/: Permission denied" }))
+    end)
+end)
+
+describe("ohos runner describe_device", function()
+    it("queries model params in one device command", function()
+        local s, parse = new_runner().describe_device("FMR0123504000090")
+        assert.same({ "-t", "FMR0123504000090", "shell",
+            "for k in const.product.marketname const.product.model const.product.name; "
+                .. "do echo \"$k=$(param get $k 2>/dev/null)\"; done" }, s.args)
+        assert.is_function(parse)
+    end)
+
+    it("prefers market name, then model; discards param-get errors", function()
+        local parse = runner_mod.parse_describe
+        assert.same({
+            display_name = "HUAWEI Mate 60 Pro",
+            properties = { market_name = "HUAWEI Mate 60 Pro", model = "ALN-AL00", product_name = "Mate 60 Pro" },
+        }, parse({ "const.product.marketname=HUAWEI Mate 60 Pro\r", "const.product.model=ALN-AL00\r",
+            "const.product.name=Mate 60 Pro\r" }))
+        assert.same({ display_name = "ALN-AL00", properties = { model = "ALN-AL00" } }, parse({
+            'const.product.marketname=Get parameter "const.product.marketname" fail! errNum is:106!',
+            "const.product.model=ALN-AL00", "const.product.name=",
+        }))
+        assert.is_nil(parse({}))
+        assert.is_nil(parse({ "[Fail]ExecuteCommand need connect-key? please confirm a device by help info" }))
+        assert.is_nil(parse({ "unrelated=Thing", "const.product.model=" }))
     end)
 end)
 

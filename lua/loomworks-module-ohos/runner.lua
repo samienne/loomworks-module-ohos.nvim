@@ -18,8 +18,18 @@ local M = {}
 --- Device-side directory under which core stages files (core §18.4).
 M.STAGING_BASE = "/data/local/tmp/.device-staging"
 
---- Where the device writes native crash reports (faultlogger).
+--- Where hiview publishes native crash reports (`cppcrash-*.log`).
 M.FAULTLOG_DIR = "/data/log/faultlog/faultlogger"
+
+--- Where faultloggerd writes its raw crash dump
+--- (`cppcrash-<pid>-<timestamp>.json`, full stack) at the moment of the
+--- crash. Observed on a device: hiview did NOT always publish a
+--- faultlogger report for a crash (none >90 s after a SIGSEGV of a
+--- program exec'd by a long absolute path) while this file was written.
+M.FAULTLOG_TEMP_DIR = "/data/log/faultlog/temp"
+
+--- Crash report directories the snapshot lists (both, always).
+M.CRASH_DIRS = { M.FAULTLOG_DIR, M.FAULTLOG_TEMP_DIR }
 
 --- OHOS ABI → LLVM target triple (the per-arch lib dir under the
 --- SDK's `native/llvm/lib/`).
@@ -41,6 +51,29 @@ local function pesc(s)
     return (s:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"))
 end
 
+--- The program word the exec script hands to `exec`: `./<basename>`
+--- when the program lives in the working directory, else unchanged.
+---
+--- Why: faultloggerd records the crashing process's name (PNAME) from its
+--- exec path truncated to 128 bytes, and hiview's faultlogger report was
+--- observed missing for a program exec'd by its long absolute staging
+--- path, while `./<name>` from the cwd produced one (device-verified).
+--- Only an absolute `argv[1]` whose directory equals `cwd` is rewritten;
+--- bare utility names (`mkdir`, resolved via PATH) and relative or other
+--- paths are kept as they are.
+--- @param program string argv[1]
+--- @param cwd string|nil
+--- @return string
+function M.exec_program(program, cwd)
+    if type(program) ~= "string" or type(cwd) ~= "string" or cwd == "" then return program end
+    local dir, base = program:match("^(/.-)/?([^/]+)$")
+    if not dir or not base then return program end
+    dir = dir:gsub("/+$", "")
+    local c = cwd:gsub("/+$", "")
+    if dir ~= c then return program end
+    return "./" .. base
+end
+
 local function check_nonce(nonce)
     if type(nonce) ~= "string" or not nonce:match("^%w+$") then
         error("ohos runner: nonce must be alphanumeric", 3)
@@ -51,15 +84,16 @@ end
 ---
 ---   cd '<cwd>' || { echo __LW_EXIT_<n>=126; exit 126; };
 ---   K='V' ... LD_LIBRARY_PATH='<d1>:<d2>'"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
----     sh -c 'echo __LW_PID_<n>=$$; exec "$0" "$@"' '<argv1>' '<argv2>' ...;
+---     sh -c 'echo __LW_PID_<n>=$$; exec "$0" "$@"' '<prog>' '<argv2>' ...;
 ---   echo __LW_EXIT_<n>=$?
 ---
 --- The inner `sh -c ... exec` makes the announced pid the program's own
 --- (exec keeps the pid) while the outer shell survives to print the exit
---- sentinel. Env NAMES are emitted unquoted — a quoted name is not an
---- assignment — which is safe because they are checked to be portable
---- identifiers (core refuses anything else before calling us; we check
---- again). Every value and argument is single-quoted (`hdc.quote`).
+--- sentinel. `<prog>` is `./<basename>` when argv[1] lives in `cwd`
+--- (`M.exec_program`), else argv[1] itself. Env NAMES are emitted
+--- unquoted — a quoted name is not an assignment — which is safe because
+--- they are checked to be portable identifiers (core refuses anything
+--- else before calling us; we check again). Every value and argument is single-quoted (`hdc.quote`).
 --- @param request { argv: string[], cwd?: string, env?: table<string,string>, library_dirs?: string[], nonce: string }
 --- @return string script ONE device command line
 function M.render_exec_script(request)
@@ -104,7 +138,9 @@ function M.render_exec_script(request)
     local run = {}
     if #assigns > 0 then run[#run + 1] = table.concat(assigns, " ") end
     run[#run + 1] = "sh -c " .. hdc.quote(inner)
-    run[#run + 1] = hdc.join(argv)
+    local words = { M.exec_program(argv[1], cwd) }
+    for i = 2, #argv do words[i] = argv[i] end
+    run[#run + 1] = hdc.join(words)
 
     local parts = {}
     if cwd then
@@ -144,6 +180,122 @@ function M.parse_pid(line, nonce)
     line = hdc.normalize_line(line)
     local pid = line:match("^" .. pesc(PID_TAG .. nonce) .. "=(%d+)$")
     return pid and tonumber(pid) or nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Crash reports
+-- ---------------------------------------------------------------------------
+
+--- Device command listing every crash report in `M.CRASH_DIRS`, one full
+--- path per line. A shell loop (not `ls`) so an empty or missing
+--- directory prints nothing; the unmatched glob word is skipped by the
+--- `-e` test. The paths are constants — no caller data reaches the text.
+--- @return string
+function M.crash_list_command()
+    local globs = {}
+    for i, d in ipairs(M.CRASH_DIRS) do globs[i] = d .. "/cppcrash-*" end
+    return "for f in " .. table.concat(globs, " ")
+        .. '; do [ -e "$f" ] && echo "$f"; done'
+end
+
+--- Parse the crash listing into a set of full remote paths. Only whole
+--- lines naming a `cppcrash-*` file directly inside one of
+--- `M.CRASH_DIRS` count; anything else (errors, `[Fail]`) is ignored.
+--- @param lines string[]
+--- @return table<string, true>
+function M.parse_crash_list(lines)
+    local set = {}
+    for _, raw in ipairs(lines or {}) do
+        local line = vim.trim(hdc.normalize_line(raw))
+        for _, d in ipairs(M.CRASH_DIRS) do
+            if line:sub(1, #d + 1) == d .. "/" then
+                local name = line:sub(#d + 2)
+                if name:match("^cppcrash%-[^/]+$") then set[line] = true end
+            end
+        end
+    end
+    return set
+end
+
+--- Crash reports new since the snapshot (core §18.2 `crash_collect`).
+---
+--- Every new faultlogger report is returned (its name does not reliably
+--- carry the pid). A new faultloggerd dump in the temp dir is returned
+--- when its name is `cppcrash-<pid>-…` for the run's pid; without a pid
+--- (`ctx` absent — core may not pass it) every new temp dump is returned:
+--- the snapshot diff already confines them to the run's window.
+--- @param before table<string, true>|nil
+--- @param after table<string, true>|nil
+--- @param ctx { pid?: integer }|nil optional run context
+--- @return string[] sorted remote paths
+function M.crash_collect(before, after, ctx)
+    before = before or {}
+    local pid = type(ctx) == "table" and tonumber(ctx.pid) or nil
+    if pid and (pid < 1 or pid ~= math.floor(pid)) then pid = nil end
+    local temp_prefix = M.FAULTLOG_TEMP_DIR .. "/"
+    local out = {}
+    for path in pairs(after or {}) do
+        if type(path) == "string" and not before[path] then
+            local keep = true
+            if pid and path:sub(1, #temp_prefix) == temp_prefix then
+                local file_pid = path:sub(#temp_prefix + 1):match("^cppcrash%-(%d+)%-")
+                keep = file_pid ~= nil and tonumber(file_pid) == pid
+            end
+            if keep then out[#out + 1] = path end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+-- ---------------------------------------------------------------------------
+-- Device description (model names)
+-- ---------------------------------------------------------------------------
+
+--- System parameters queried per device, with their `properties` keys.
+--- Display name preference: market name, then model, then product name.
+M.DESCRIBE_PARAMS = {
+    { param = "const.product.marketname", key = "market_name" },
+    { param = "const.product.model", key = "model" },
+    { param = "const.product.name", key = "product_name" },
+}
+
+--- Device command printing `<param>=<value>` for each describe param
+--- (constants only). `param get` of an unset parameter prints an error
+--- text; the parser discards it.
+--- @return string
+function M.describe_command()
+    local ps = {}
+    for i, p in ipairs(M.DESCRIBE_PARAMS) do ps[i] = p.param end
+    return "for k in " .. table.concat(ps, " ")
+        .. '; do echo "$k=$(param get $k 2>/dev/null)"; done'
+end
+
+--- Parse the describe output.
+--- @param lines string[]
+--- @return { display_name?: string, properties: table<string,string> }|nil
+function M.parse_describe(lines)
+    local by_param = {}
+    for _, p in ipairs(M.DESCRIBE_PARAMS) do by_param[p.param] = p.key end
+    local props = {}
+    for _, raw in ipairs(lines or {}) do
+        local line = vim.trim(hdc.normalize_line(raw))
+        local k, v = line:match("^([%w%._]+)=(.*)$")
+        local key = k and by_param[k]
+        if key then
+            v = vim.trim(v)
+            local lower = v:lower()
+            if v ~= "" and not lower:match("^get parameter")
+                and not lower:find("fail", 1, true) and not lower:find("errnum", 1, true) then
+                props[key] = v
+            end
+        end
+    end
+    if next(props) == nil then return nil end
+    return {
+        display_name = props.market_name or props.model or props.product_name,
+        properties = props,
+    }
 end
 
 --- Build the log Session (core §18.13) for one run.
@@ -232,8 +384,8 @@ function M.new(opts)
         staging_base = M.STAGING_BASE,
         archive = true,
         -- Device-side argv prefix printing `<hex>  <path>` per file.
-        -- VERIFY on device: toybox `sha256sum` on HarmonyOS NEXT. If it
-        -- is missing the command fails, no digests come back and core
+        -- toybox `sha256sum` exists on HarmonyOS (device-verified). If it
+        -- is ever missing the command fails, no digests come back and core
         -- simply re-stages (safe, only slower). md5sum is deliberately
         -- NOT used as an automatic fallback: the device digest must be
         -- the same algorithm core records on the host.
@@ -260,9 +412,13 @@ function M.new(opts)
             remote, hdc.local_path(local_path, win)), hdc.check_output)
     end
 
+    -- exec's check sees only connector lines (before the pid line, after
+    -- the exit sentinel) — but merged device stderr can arrive out of
+    -- order and land there, so it uses the connector-only check: hdc's
+    -- `[Fail]` markers, never a program's own `error: ...` text.
     function R.exec(serial, request)
         return spec(hdc.shell_argv(serial, M.render_exec_script(request)),
-            hdc.check_output)
+            hdc.check_connector_output)
     end
 
     R.parse_exit = M.parse_exit
@@ -278,33 +434,24 @@ function M.new(opts)
             "kill " .. p .. " 2>/dev/null; sleep 1; kill -9 " .. p .. " 2>/dev/null"))
     end
 
-    --- Snapshot of existing native crash reports: returns the spec and a
-    --- parser turning its output into a set of `cppcrash-*` names.
+    --- Snapshot of existing native crash reports in both crash dirs
+    --- (faultlogger reports and faultloggerd temp dumps): returns the
+    --- spec and a parser turning its output into a set of full paths.
     function R.crash_snapshot(serial)
-        local s = spec(hdc.shell_words(serial, { "ls", "-1", M.FAULTLOG_DIR .. "/" }))
-        local function parse(lines)
-            local set = {}
-            for _, raw in ipairs(lines or {}) do
-                for word in hdc.normalize_line(raw):gmatch("%S+") do
-                    local name = word:match("([^/]+)$")
-                    if name and name:match("^cppcrash%-") then set[name] = true end
-                end
-            end
-            return set
-        end
-        return s, parse
+        return spec(hdc.shell_argv(serial, M.crash_list_command()), hdc.check_connector_output),
+            M.parse_crash_list
     end
 
-    --- Remote paths of crash reports present in `after` but not `before`.
-    function R.crash_collect(before, after)
-        local out = {}
-        for name in pairs(after or {}) do
-            if not (before or {})[name] then
-                out[#out + 1] = M.FAULTLOG_DIR .. "/" .. name
-            end
-        end
-        table.sort(out)
-        return out
+    --- Remote paths of crash reports new since the snapshot; the optional
+    --- third argument `{ pid }` confines temp dumps to the run's pid.
+    R.crash_collect = M.crash_collect
+
+    --- Optional device description (model name) for one ONLINE device:
+    --- returns the spec and `parse(lines)` →
+    --- `{ display_name?, properties }` or nil. One hdc call per device.
+    function R.describe_device(serial)
+        return spec(hdc.shell_argv(serial, M.describe_command()), hdc.check_connector_output),
+            M.parse_describe
     end
 
     --- Platform runtime files a program built by `tool` needs beside it:
