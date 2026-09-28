@@ -253,7 +253,9 @@ end
 -- ---------------------------------------------------------------------------
 
 --- System parameters queried per device, with their `properties` keys.
---- Display name preference: market name, then model, then product name.
+--- Display name preference: market name, then product name, then model
+--- (device-verified, Mate 60 Pro: no marketname parameter,
+--- const.product.name = "HUAWEI Mate 60 Pro", model = "ALN-AL00").
 M.DESCRIBE_PARAMS = {
     { param = "const.product.marketname", key = "market_name" },
     { param = "const.product.model", key = "model" },
@@ -262,7 +264,8 @@ M.DESCRIBE_PARAMS = {
 
 --- Device command printing `<param>=<value>` for each describe param
 --- (constants only). `param get` of an unset parameter prints an error
---- text; the parser discards it.
+--- text (e.g. `get param: const.product.marketname fail! errNum is:106!`);
+--- the parser discards it.
 --- @return string
 function M.describe_command()
     local ps = {}
@@ -271,29 +274,45 @@ function M.describe_command()
         .. '; do echo "$k=$(param get $k 2>/dev/null)"; done'
 end
 
---- Parse the describe output.
+--- True when `text` is `param get` error output rather than a value.
+local function is_param_error(text)
+    local lower = text:lower()
+    return lower:find("fail!", 1, true) ~= nil
+        or lower:find("errnum", 1, true) ~= nil
+        or lower:match("^get param") ~= nil
+end
+
+--- Parse the describe output. A parameter whose value is `param get`
+--- error text — or that a bare error line names — is treated as absent.
 --- @param lines string[]
 --- @return { display_name?: string, properties: table<string,string> }|nil
 function M.parse_describe(lines)
     local by_param = {}
     for _, p in ipairs(M.DESCRIBE_PARAMS) do by_param[p.param] = p.key end
-    local props = {}
+    local props, failed = {}, {}
     for _, raw in ipairs(lines or {}) do
         local line = vim.trim(hdc.normalize_line(raw))
         local k, v = line:match("^([%w%._]+)=(.*)$")
         local key = k and by_param[k]
         if key then
             v = vim.trim(v)
-            local lower = v:lower()
-            if v ~= "" and not lower:match("^get parameter")
-                and not lower:find("fail", 1, true) and not lower:find("errnum", 1, true) then
+            if is_param_error(v) then
+                failed[key] = true
+            elseif v ~= "" then
                 props[key] = v
+            end
+        elseif is_param_error(line) then
+            -- Bare error line (e.g. a multi-line `param get` result):
+            -- every describe param it names is absent.
+            for param, pkey in pairs(by_param) do
+                if line:find(param, 1, true) then failed[pkey] = true end
             end
         end
     end
+    for key in pairs(failed) do props[key] = nil end
     if next(props) == nil then return nil end
     return {
-        display_name = props.market_name or props.model or props.product_name,
+        display_name = props.market_name or props.product_name or props.model,
         properties = props,
     }
 end

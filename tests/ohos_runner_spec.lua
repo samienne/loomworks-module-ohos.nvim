@@ -389,17 +389,51 @@ describe("ohos runner describe_device", function()
         assert.is_function(parse)
     end)
 
-    it("prefers market name, then model; discards param-get errors", function()
+    it("prefers market name, then product name, then model", function()
         local parse = runner_mod.parse_describe
         assert.same({
-            display_name = "HUAWEI Mate 60 Pro",
-            properties = { market_name = "HUAWEI Mate 60 Pro", model = "ALN-AL00", product_name = "Mate 60 Pro" },
-        }, parse({ "const.product.marketname=HUAWEI Mate 60 Pro\r", "const.product.model=ALN-AL00\r",
-            "const.product.name=Mate 60 Pro\r" }))
+            display_name = "HUAWEI Mate 60",
+            properties = { market_name = "HUAWEI Mate 60", model = "ALN-AL00", product_name = "HUAWEI Mate 60 Pro" },
+        }, parse({ "const.product.marketname=HUAWEI Mate 60\r", "const.product.model=ALN-AL00\r",
+            "const.product.name=HUAWEI Mate 60 Pro\r" }))
         assert.same({ display_name = "ALN-AL00", properties = { model = "ALN-AL00" } }, parse({
-            'const.product.marketname=Get parameter "const.product.marketname" fail! errNum is:106!',
-            "const.product.model=ALN-AL00", "const.product.name=",
+            "const.product.marketname=", "const.product.model=ALN-AL00", "const.product.name=",
         }))
+    end)
+
+    it("real Mate 60 Pro shape: missing marketname error is absent, product name wins", function()
+        local parse = runner_mod.parse_describe
+        local want = {
+            display_name = "HUAWEI Mate 60 Pro",
+            properties = { model = "ALN-AL00", product_name = "HUAWEI Mate 60 Pro" },
+        }
+        -- Error text captured into the value.
+        assert.same(want, parse({
+            "const.product.marketname=get param: const.product.marketname fail! errNum is:106!\r",
+            "const.product.model=ALN-AL00\r",
+            "const.product.name=HUAWEI Mate 60 Pro\r",
+        }))
+        -- Variant wording.
+        assert.same(want, parse({
+            'const.product.marketname=Get parameter "const.product.marketname" fail! errNum is:106!',
+            "const.product.model=ALN-AL00", "const.product.name=HUAWEI Mate 60 Pro",
+        }))
+        -- Error on its own line after an empty value (multi-line result).
+        assert.same(want, parse({
+            "const.product.marketname=",
+            "get param: const.product.marketname fail! errNum is:106!",
+            "const.product.model=ALN-AL00", "const.product.name=HUAWEI Mate 60 Pro",
+        }))
+        -- A bare error line naming a key drops that key even after a
+        -- stray value.
+        assert.same(want, parse({
+            "const.product.marketname=garbage",
+            "param get const.product.marketname errNum is:106",
+            "const.product.model=ALN-AL00", "const.product.name=HUAWEI Mate 60 Pro",
+        }))
+        -- A legitimate value merely containing "fail" is kept.
+        assert.same({ display_name = "Failsafe X", properties = { product_name = "Failsafe X" } },
+            parse({ "const.product.name=Failsafe X" }))
         assert.is_nil(parse({}))
         assert.is_nil(parse({ "[Fail]ExecuteCommand need connect-key? please confirm a device by help info" }))
         assert.is_nil(parse({ "unrelated=Thing", "const.product.model=" }))

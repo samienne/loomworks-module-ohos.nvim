@@ -301,8 +301,6 @@ prefilter default and truncation-tolerant proc matching (harmony.md §6.5).
 
 Still unverified:
 
-- **`const.product.marketname`** as the market-name parameter on every
-  build (§8.8) — an unset parameter only falls back to the model.
 - **Faultlogger readability** for a non-root shell user on user builds.
 
 ### 8.7 Crash reports
@@ -337,8 +335,21 @@ device prints `<param>=<value>` for `const.product.marketname`,
 non-empty values that are not `param get` error text and returns
 
 ```lua
-{ display_name = marketname or model or product_name,
+{ display_name = marketname or product_name or model,
   properties = { market_name = …, model = …, product_name = … } }  -- present keys only
 ```
 
 or `nil` when nothing usable came back (core then keeps the serial).
+
+`param get` of an unset parameter prints error text such as
+`get param: const.product.marketname fail! errNum is:106!` (wording
+varies). A value containing `fail!` or `errNum` (case-insensitive), or
+starting with `get param`, is error text; so is a bare output line with
+those markers, which marks every describe parameter it names as absent
+even if a value line for it was seen. Absent parameters are omitted from
+`properties`.
+
+Device-verified (Mate 60 Pro): `const.product.marketname` is **unset**
+(errNum 106), `const.product.name` = `HUAWEI Mate 60 Pro`,
+`const.product.model` = `ALN-AL00` — hence product name before model;
+the model code is only the last resort.
