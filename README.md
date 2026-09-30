@@ -15,7 +15,10 @@ Ships:
   executables from those cmake kits on an attached device (`lw run` /
   `lw test` on a foreign build): staging over `hdc`, exit status,
   crash-report collection and a filtered hilog stream. The connector is
-  always the SDK's own `hdc` (never one found on `PATH`).
+  always the SDK's own `hdc` (never one found on `PATH`). A program left
+  running by a run that was killed without cleaning up is stopped by the
+  next run on that device (after checking the process is still that
+  program).
 - `hvigor` build progress parser — recognises hvigor's progress lines
   and feeds them into the loomworks progress aggregator.
 

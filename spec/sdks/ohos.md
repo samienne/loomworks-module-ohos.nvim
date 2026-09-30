@@ -222,6 +222,7 @@ the runner and the harmony module:
 | `parse_exit(line, n)` | — | `__LW_EXIT_<n>=<status>` at the **end** of the line (after CR strip). Returns the status and, as a second value, any program text that preceded the sentinel on the same line (a last output line without a newline) |
 | `parse_pid(line, n)` | — | whole line `__LW_PID_<n>=<pid>` |
 | `terminate(s, n, pid)` | `-t s shell "kill <pid> 2>/dev/null; sleep 1; kill -9 <pid> 2>/dev/null"` | only a positive integer pid (from `parse_pid`); without one it returns `nil` (nothing sent) |
+| `reap(s, leftover)` | `-t s shell <reap script>` (one element, §8.9) | core §18.7: stop a program an interrupted run left. Returns the spec (`check_connector_output`) and `parse(lines)` → `"stopped"` \| `"gone"` \| `nil` from the whole line `__LW_REAP_<n>=<verdict>` for the leftover's nonce (`unknown` → `nil`). Raises — nothing sent — unless `pid` is an integer ≥ 2, the nonce alphanumeric and `program` an absolute path without NUL or line breaks |
 | `crash_snapshot(s)` | `-t s shell 'for f in /data/log/faultlog/faultlogger/cppcrash-* /data/log/faultlog/temp/cppcrash-*; do [ -e "$f" ] && echo "$f"; done'` | returns the spec (`check_connector_output`) and `parse(lines)` → set of **full paths** of `cppcrash-*` files directly in either directory (§8.7); other lines are ignored |
 | `crash_collect(b, a, ctx?)` | — | sorted paths in `a` not in `b`: every new faultlogger report, and new temp dumps — only `cppcrash-<pid>-…` when `ctx.pid` is given, all of them otherwise (§8.7) |
 | `describe_device(s)` | `-t s shell 'for k in const.product.marketname const.product.model const.product.name; do echo "$k=$(param get $k 2>/dev/null)"; done'` | *(optional, §8.8)* returns the spec (`check_connector_output`) and `parse(lines)` → `{ display_name?, properties }` or `nil` |
@@ -353,3 +354,38 @@ Device-verified (Mate 60 Pro): `const.product.marketname` is **unset**
 (errNum 106), `const.product.name` = `HUAWEI Mate 60 Pro`,
 `const.product.model` = `ALN-AL00` — hence product name before model;
 the model code is only the last resort.
+
+### 8.9 Reaping a leftover program (`reap`, core §18.7)
+
+A run that loses its cleanup (lw killed with `taskkill /F`, a power loss)
+leaves its program running on the device; the next run that reclaims the
+stale device lock hands `reap` the recorded `{ pid, nonce, program }`
+(`program` = the staged device-side path). The script (`M.render_reap_script`):
+
+```
+p=<pid>; w=<program>; x() { e=$(readlink /proc/$p/exe 2>/dev/null); [ "$e" = "$w" ] || [ "$e" = "$w (deleted)" ]; }
+if ! [ -d /proc/$p ]; then echo __LW_REAP_<n>=gone
+elif [ -z "$(readlink /proc/$p/exe 2>/dev/null)" ]; then echo __LW_REAP_<n>=unknown
+elif ! x; then echo __LW_REAP_<n>=gone
+else x && kill $p 2>/dev/null; sleep 1; x && kill -9 $p 2>/dev/null; sleep 1
+if x; then echo __LW_REAP_<n>=unknown; else echo __LW_REAP_<n>=stopped; fi; fi
+```
+
+(one line, parts joined with `; `; `<program>` single-quoted when needed).
+
+- **Identity, not just the pid.** The exec script's inner `exec` makes the
+  announced pid the program's own, so `/proc/<pid>/exe` of a still-running
+  leftover is the staged program. A pid the device has since given to
+  another process points elsewhere: `gone`, and it is never signalled. Every
+  signal is re-guarded by the same check. `<program> (deleted)` also matches
+  (a program file replaced since).
+- A live process whose link cannot be read (another user's) cannot be
+  judged: `unknown`, nothing sent. After `kill`, a grace second, and
+  `kill -9` only if it is still the program; a process that is still the
+  program after that is `unknown`. A zombie has no readable link and counts
+  as stopped.
+- The outer shell of the exec script (which would print the exit sentinel)
+  ends on its own once the program is gone.
+- Unverified on a real device yet: that the `shell` user can read
+  `/proc/<pid>/exe` of the programs it started through hdc (it runs them as
+  the same user, so it should) and that the link is the absolute staged path.
