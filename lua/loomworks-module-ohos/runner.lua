@@ -80,10 +80,14 @@ local function check_nonce(nonce)
     end
 end
 
+--- The environment variable carrying the run's nonce into the program
+--- (core §18.2 run token; `reap` identifies a leftover by it).
+M.RUN_TOKEN_VAR = "LOOMWORKS_RUN_NONCE"
+
 --- Render the device-side shell script for an exec request (core §18.2).
 ---
 ---   cd '<cwd>' || { echo __LW_EXIT_<n>=126; exit 126; };
----   K='V' ... LD_LIBRARY_PATH='<d1>:<d2>'"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+---   K='V' ... LOOMWORKS_RUN_NONCE=<n> LD_LIBRARY_PATH='<d1>:<d2>'"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ---     sh -c 'echo __LW_PID_<n>=$$; exec "$0" "$@"' '<prog>' '<argv2>' ...;
 ---   echo __LW_EXIT_<n>=$?
 ---
@@ -120,6 +124,12 @@ function M.render_exec_script(request)
         if name ~= "LD_LIBRARY_PATH" then
             assigns[#assigns + 1] = name .. "=" .. hdc.quote(tostring(env[name]))
         end
+    end
+    -- The run token (core §18.2): identifies the program for `reap` even
+    -- when its executable path can no longer be resolved (staging removed).
+    -- Never replaces a variable the request sets itself.
+    if env[M.RUN_TOKEN_VAR] == nil then
+        assigns[#assigns + 1] = M.RUN_TOKEN_VAR .. "=" .. n
     end
     local dirs = request.library_dirs or {}
     if #dirs > 0 then
@@ -191,25 +201,45 @@ local REAP_TAG = "__LW_REAP_"
 --- Seconds between the polite `kill`, the `kill -9` and the final check.
 M.REAP_GRACE = 1
 
+-- The reap script (spec/sdks/ohos.md §8.9). `@P@` pid, `@W@` quoted program
+-- path, `@B@` quoted base name, `@N@` nonce, `@G@` grace seconds. One line.
+--   isp: is process $p this run's program? 0 yes / 1 another program /
+--        2 cannot tell. Yes when its exe is the staged path (or that path
+--        "(deleted)"), or when its exe base name is the program's AND its
+--        environ holds exactly LOOMWORKS_RUN_NONCE=<nonce>.
+--   isw: is process $1 this run's wrapper? Its exe is this shell's and its
+--        command line holds __LW_EXIT_<nonce>= (the tag is assembled, `t`,
+--        so this script's own command line never matches it).
+local REAP_SCRIPT = table.concat({
+    [[p=@P@; w=@W@; b=@B@; v=LOOMWORKS_RUN_NONCE=@N@; t=__LW_EXIT""_@N@=; me=$(readlink /proc/$$/exe 2>/dev/null)]],
+    [[isp() { e=$(readlink /proc/$p/exe 2>/dev/null); [ -n "$e" ] || return 2; if [ "$e" = "$w" ] || [ "$e" = "$w (deleted)" ]; then return 0; fi; n=${e%" (deleted)"}; [ "${n##*/}" = "$b" ] || return 1; en=$(tr '\000' '\n' < /proc/$p/environ 2>/dev/null) || return 2; if printf '%s\n' "$en" | grep -qxF -- "$v"; then return 0; fi; return 1; }]],
+    [[isw() { [ -n "$1" ] && [ "$1" != "$$" ] && [ "$1" -gt 1 ] 2>/dev/null && [ -n "$me" ] && [ "$(readlink /proc/$1/exe 2>/dev/null)" = "$me" ] && grep -qF -- "$t" /proc/$1/cmdline 2>/dev/null; }]],
+    [[ws=; pp=; if [ -r /proc/$p/stat ]; then read -r s < /proc/$p/stat; s=${s##*) }; set -- $s; pp=$2; isw "$pp" && ws=$pp; fi]],
+    [[if [ -z "$ws" ] && ! [ -d /proc/$p ]; then for d in /proc/[0-9]*; do q=${d#/proc/}; isw "$q" && ws="$ws $q"; done; fi]],
+    [[if ! [ -d /proc/$p ]; then r=gone; else isp; c=$?; if [ $c = 2 ]; then r=unknown; elif [ $c = 1 ]; then r=gone; else kill $p 2>/dev/null; sleep @G@; isp && kill -9 $p 2>/dev/null; sleep @G@; if isp; then r=unknown; else r=stopped; fi; fi; fi]],
+    [[if [ "$r" != unknown ] && [ -n "$ws" ]; then for q in $ws; do isw "$q" && kill $q 2>/dev/null; done; sleep @G@; for q in $ws; do isw "$q" && kill -9 $q 2>/dev/null && echo __LW_REAP_WRAPPER_@N@=$q; done; fi]],
+    [[echo __LW_REAP_@N@=$r]],
+}, "; ")
+
 --- Render the device-side script that stops a program an interrupted run
---- left behind — ONLY while process `pid` is still that program:
+--- left behind — ONLY while process `pid` is still that run's program — and
+--- then that run's wrapper shell (the `sh -c <exec script>` hdcd ran, which
+--- can outlive its program), identified by the nonce in its command line.
 ---
----   p=<pid>; w=<program>; x() { e=$(readlink /proc/$p/exe 2>/dev/null);
----     [ "$e" = "$w" ] || [ "$e" = "$w (deleted)" ]; };
----   if ! [ -d /proc/$p ]; then echo __LW_REAP_<n>=gone;
----   elif [ -z "$(readlink /proc/$p/exe 2>/dev/null)" ]; then echo __LW_REAP_<n>=unknown;
----   elif ! x; then echo __LW_REAP_<n>=gone;
----   else kill $p 2>/dev/null; sleep <grace>; x && kill -9 $p 2>/dev/null; sleep <grace>;
----   if x; then echo __LW_REAP_<n>=unknown; else echo __LW_REAP_<n>=stopped; fi; fi
+--- Identity of the program (`isp`): its `/proc/<pid>/exe` is the staged
+--- path, or — once the staging tree is gone the link turns relative — its
+--- exe base name is the program's and its environ carries this run's token
+--- (`LOOMWORKS_RUN_NONCE=<nonce>`, exported by the exec script). A process
+--- whose exe cannot be read, or whose environ cannot be read when the path
+--- does not match, cannot be judged: `unknown`, nothing sent. Another
+--- program under the pid is
+--- `gone` and never signalled. Each signal is re-guarded by the check; a
+--- zombie has no readable link and counts as stopped.
 ---
---- The identity check is `/proc/<pid>/exe`: the pid the exec script
---- announces is the program's own (`exec` keeps it), so its executable link
---- is the staged program; a pid the device has since reused for another
---- process points elsewhere and is reported `gone`, never signalled. An
---- unreadable link on a live process (another user's) cannot be judged:
---- `unknown`, nothing sent. `(deleted)` covers a program file replaced since.
---- Each signal is re-guarded by the check. A zombie (exited, not yet waited
---- for) has no readable link, so it counts as stopped.
+--- The wrapper's pid is read from the program's `/proc/<pid>/stat` BEFORE
+--- the program is signalled (once it dies the wrapper is reparented); when
+--- the program is already gone, `/proc` is scanned for the wrapper. Wrappers
+--- are signalled only after the program, and never after an `unknown`.
 --- @param leftover { pid: integer, nonce: string, program: string }
 --- @return string|nil script, string|nil err
 function M.render_reap_script(leftover)
@@ -222,17 +252,13 @@ function M.render_reap_script(leftover)
     if type(program) ~= "string" or not program:match("^/") or program:find("[%z\r\n]") then
         return nil, "invalid program path"
     end
-    local tag = REAP_TAG .. nonce .. "="
-    local grace = tostring(M.REAP_GRACE)
-    return table.concat({
-        string.format("p=%d; w=%s", pid, hdc.quote(program)),
-        'x() { e=$(readlink /proc/$p/exe 2>/dev/null); [ "$e" = "$w" ] || [ "$e" = "$w (deleted)" ]; }',
-        "if ! [ -d /proc/$p ]; then echo " .. tag .. "gone",
-        'elif [ -z "$(readlink /proc/$p/exe 2>/dev/null)" ]; then echo ' .. tag .. "unknown",
-        "elif ! x; then echo " .. tag .. "gone",
-        "else x && kill $p 2>/dev/null; sleep " .. grace .. "; x && kill -9 $p 2>/dev/null; sleep " .. grace,
-        "if x; then echo " .. tag .. "unknown; else echo " .. tag .. "stopped; fi; fi",
-    }, "; ")
+    local base = program:match("([^/]+)$")
+    if not base then return nil, "invalid program path" end
+    local subst = {
+        P = string.format("%d", pid), W = hdc.quote(program), B = hdc.quote(base),
+        N = nonce, G = tostring(M.REAP_GRACE),
+    }
+    return (REAP_SCRIPT:gsub("@(%u)@", function(k) return subst[k] end))
 end
 
 --- Parse the reap script's output for `nonce`: "stopped", "gone" or nil
