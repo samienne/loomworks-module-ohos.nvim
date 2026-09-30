@@ -183,6 +183,74 @@ function M.parse_pid(line, nonce)
 end
 
 -- ---------------------------------------------------------------------------
+-- Reaping a leftover program (core §18.7 / §18.2 `reap`)
+-- ---------------------------------------------------------------------------
+
+local REAP_TAG = "__LW_REAP_"
+
+--- Seconds between the polite `kill`, the `kill -9` and the final check.
+M.REAP_GRACE = 1
+
+--- Render the device-side script that stops a program an interrupted run
+--- left behind — ONLY while process `pid` is still that program:
+---
+---   p=<pid>; w=<program>; x() { e=$(readlink /proc/$p/exe 2>/dev/null);
+---     [ "$e" = "$w" ] || [ "$e" = "$w (deleted)" ]; };
+---   if ! [ -d /proc/$p ]; then echo __LW_REAP_<n>=gone;
+---   elif [ -z "$(readlink /proc/$p/exe 2>/dev/null)" ]; then echo __LW_REAP_<n>=unknown;
+---   elif ! x; then echo __LW_REAP_<n>=gone;
+---   else kill $p 2>/dev/null; sleep <grace>; x && kill -9 $p 2>/dev/null; sleep <grace>;
+---   if x; then echo __LW_REAP_<n>=unknown; else echo __LW_REAP_<n>=stopped; fi; fi
+---
+--- The identity check is `/proc/<pid>/exe`: the pid the exec script
+--- announces is the program's own (`exec` keeps it), so its executable link
+--- is the staged program; a pid the device has since reused for another
+--- process points elsewhere and is reported `gone`, never signalled. An
+--- unreadable link on a live process (another user's) cannot be judged:
+--- `unknown`, nothing sent. `(deleted)` covers a program file replaced since.
+--- Each signal is re-guarded by the check. A zombie (exited, not yet waited
+--- for) has no readable link, so it counts as stopped.
+--- @param leftover { pid: integer, nonce: string, program: string }
+--- @return string|nil script, string|nil err
+function M.render_reap_script(leftover)
+    if type(leftover) ~= "table" then return nil, "no leftover" end
+    local pid = leftover.pid
+    if type(pid) ~= "number" or pid < 2 or pid ~= math.floor(pid) then return nil, "invalid pid" end
+    local nonce = leftover.nonce
+    if type(nonce) ~= "string" or not nonce:match("^%w+$") then return nil, "invalid nonce" end
+    local program = leftover.program
+    if type(program) ~= "string" or not program:match("^/") or program:find("[%z\r\n]") then
+        return nil, "invalid program path"
+    end
+    local tag = REAP_TAG .. nonce .. "="
+    local grace = tostring(M.REAP_GRACE)
+    return table.concat({
+        string.format("p=%d; w=%s", pid, hdc.quote(program)),
+        'x() { e=$(readlink /proc/$p/exe 2>/dev/null); [ "$e" = "$w" ] || [ "$e" = "$w (deleted)" ]; }',
+        "if ! [ -d /proc/$p ]; then echo " .. tag .. "gone",
+        'elif [ -z "$(readlink /proc/$p/exe 2>/dev/null)" ]; then echo ' .. tag .. "unknown",
+        "elif ! x; then echo " .. tag .. "gone",
+        "else x && kill $p 2>/dev/null; sleep " .. grace .. "; x && kill -9 $p 2>/dev/null; sleep " .. grace,
+        "if x; then echo " .. tag .. "unknown; else echo " .. tag .. "stopped; fi; fi",
+    }, "; ")
+end
+
+--- Parse the reap script's output for `nonce`: "stopped", "gone" or nil
+--- (unknown, or no verdict line).
+--- @param lines string[]
+--- @param nonce string
+--- @return "stopped"|"gone"|nil
+function M.parse_reap(lines, nonce)
+    if type(lines) ~= "table" or type(nonce) ~= "string" then return nil end
+    for _, l in ipairs(lines) do
+        local v = hdc.normalize_line(tostring(l)):match("^" .. pesc(REAP_TAG .. nonce) .. "=(%a+)$")
+        if v == "stopped" or v == "gone" then return v end
+        if v then return nil end
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
 -- Crash reports
 -- ---------------------------------------------------------------------------
 
@@ -451,6 +519,19 @@ function M.new(opts)
         local p = string.format("%d", pid)
         return spec(hdc.shell_argv(serial,
             "kill " .. p .. " 2>/dev/null; sleep 1; kill -9 " .. p .. " 2>/dev/null"))
+    end
+
+    --- Stop a program an interrupted run left (core §18.7), verified by
+    --- `/proc/<pid>/exe` against the staged program before any signal
+    --- (`M.render_reap_script`). Returns the spec and `parse(lines)` →
+    --- "stopped" | "gone" | nil. An invalid leftover raises (core reports a
+    --- warning; nothing is sent).
+    function R.reap(serial, leftover)
+        local script, err = M.render_reap_script(leftover)
+        if not script then error("ohos runner: cannot reap: " .. tostring(err), 2) end
+        local nonce = leftover.nonce
+        return spec(hdc.shell_argv(serial, script), hdc.check_connector_output),
+            function(lines) return M.parse_reap(lines, nonce) end
     end
 
     --- Snapshot of existing native crash reports in both crash dirs

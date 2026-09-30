@@ -52,7 +52,7 @@ describe("ohos runner identity", function()
         assert.is_true(r.combined_output)
         assert.is_nil(r.timeouts)
         for _, b in ipairs({ "list_devices", "parse_devices", "push", "pull", "exec",
-            "parse_exit", "parse_pid", "terminate", "crash_snapshot", "crash_collect",
+            "parse_exit", "parse_pid", "terminate", "reap", "crash_snapshot", "crash_collect",
             "describe_device", "runtime_files", "log_session" }) do
             assert.is_function(r[b], b)
         end
@@ -292,6 +292,98 @@ describe("ohos runner exec script", function()
         local status
         for _, l in ipairs(out) do status = status or runner_mod.parse_exit(l, "c") end
         assert.equals(126, status)
+    end)
+end)
+
+describe("ohos runner reap (core §18.7 leftover programs)", function()
+    local PROG = "/data/local/tmp/.device-staging/ws/u-0123456789/bin/prog"
+
+    it("renders one shell command that verifies /proc/<pid>/exe before any kill", function()
+        local r = new_runner()
+        local s, parse = r.reap("S1", { pid = 4242, nonce = "n1", program = PROG })
+        assert.equals(HDC, s.cmd)
+        assert.same({ "-t", "S1", "shell" }, { s.args[1], s.args[2], s.args[3] })
+        assert.equals(4, #s.args)
+        local script = s.args[4]
+        assert.truthy(script:find("p=4242; w=" .. PROG, 1, true), script)
+        assert.truthy(script:find("readlink /proc/$p/exe", 1, true), script)
+        -- the identity check precedes the first signal
+        local check = script:find("elif ! x; then", 1, true)
+        local kill = script:find("kill $p", 1, true)
+        assert.truthy(check and kill and check < kill, script)
+        assert.truthy(script:find("kill -9 $p", 1, true), script)
+        assert.is_function(s.check_output)
+        assert.is_function(parse)
+        assert.equals("stopped", parse({ "__LW_REAP_n1=stopped\r" }))
+        assert.equals("gone", parse({ "noise", "__LW_REAP_n1=gone" }))
+        assert.is_nil(parse({ "__LW_REAP_n1=unknown" }))
+        assert.is_nil(parse({ "__LW_REAP_other=stopped" })) -- another nonce
+        assert.is_nil(parse({}))
+    end)
+
+    it("quotes the program and refuses invalid leftovers (nothing is sent)", function()
+        local r = new_runner()
+        local s = r.reap("S1", { pid = 7, nonce = "n1", program = "/d/it's here/prog" })
+        assert.truthy(s.args[4]:find("w='/d/it'\\''s here/prog'", 1, true), s.args[4])
+        for _, bad in ipairs({
+            { pid = "7; rm -rf /", nonce = "n", program = PROG },
+            { pid = 1, nonce = "n", program = PROG },          -- never init
+            { pid = 7.5, nonce = "n", program = PROG },
+            { pid = 7, nonce = "a;b", program = PROG },
+            { pid = 7, nonce = "n", program = "relative/prog" },
+            { pid = 7, nonce = "n", program = "/p\nkill -9 1" },
+        }) do
+            assert.has_error(function() r.reap("S1", bad) end)
+        end
+    end)
+
+    -- The script under the host's POSIX sh against a real process: the
+    -- host's /proc stands in for the device's.
+    local function sh_ok()
+        if vim.fn.executable("sh") ~= 1 then return false end
+        local out = vim.fn.systemlist({ "sh", "-c", "[ -d /proc/$$ ] && readlink /proc/$$/exe" })
+        return vim.v.shell_error == 0 and out[1] ~= nil and out[1] ~= ""
+    end
+    local function spawn_sleeper()
+        local out = vim.fn.systemlist({ "sh", "-c", "sleep 60 >/dev/null 2>&1 </dev/null & echo $!" })
+        local pid = tonumber((out[1] or ""):match("%d+"))
+        local exe_out = vim.fn.systemlist({ "sh", "-c", "readlink /proc/" .. tostring(pid) .. "/exe" })
+        return pid, (exe_out[1] or ""):gsub("\r$", "")
+    end
+    local function alive(pid)
+        vim.fn.system({ "sh", "-c", "[ -d /proc/" .. pid .. " ]" })
+        return vim.v.shell_error == 0
+    end
+    local function run_reap(leftover)
+        local out = vim.fn.systemlist({ "sh", "-c", assert(runner_mod.render_reap_script(leftover)) })
+        return runner_mod.parse_reap(out, leftover.nonce), out
+    end
+
+    it("real sh: stops a live process that is still the program", function()
+        if not sh_ok() then pending("no sh with /proc/<pid>/exe"); return end
+        local pid, exe_path = spawn_sleeper()
+        assert.is_number(pid)
+        assert.truthy(exe_path ~= "", "readlink of the sleeper")
+        local verdict, out = run_reap({ pid = pid, nonce = "r1", program = exe_path })
+        assert.equals("stopped", verdict, table.concat(out, "\n"))
+        assert.is_false(alive(pid))
+    end)
+
+    it("real sh: pid reuse — a live process that is another program is never signalled", function()
+        if not sh_ok() then pending("no sh with /proc/<pid>/exe"); return end
+        local pid = spawn_sleeper()
+        local verdict, out = run_reap({ pid = pid, nonce = "r2", program = "/data/local/tmp/not/this/prog" })
+        assert.equals("gone", verdict, table.concat(out, "\n"))
+        assert.is_true(alive(pid))
+        vim.fn.system({ "sh", "-c", "kill -9 " .. pid })
+    end)
+
+    it("real sh: a pid with no process is gone", function()
+        if not sh_ok() then pending("no sh with /proc/<pid>/exe"); return end
+        local pid = spawn_sleeper()
+        vim.fn.system({ "sh", "-c", "kill -9 " .. pid .. "; sleep 1" })
+        local verdict = run_reap({ pid = pid, nonce = "r3", program = "/x/prog" })
+        assert.equals("gone", verdict)
     end)
 end)
 
