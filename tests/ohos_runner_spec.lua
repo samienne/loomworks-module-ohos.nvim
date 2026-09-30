@@ -160,10 +160,18 @@ describe("ohos runner exec script", function()
         })
         assert.equals(table.concat({
             "cd /d/app || { echo __LW_EXIT_N0nce=126; exit 126; }",
-            "ALPHA='it'\\''s' ZED=z LD_LIBRARY_PATH=/d/app:/d/app/plugins\"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\" "
+            "ALPHA='it'\\''s' ZED=z LOOMWORKS_RUN_NONCE=N0nce LD_LIBRARY_PATH=/d/app:/d/app/plugins\"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\" "
                 .. "sh -c 'echo __LW_PID_N0nce=$$; exec \"$0\" \"$@\"' ./prog '--gtest_filter=A.*'",
             "echo __LW_EXIT_N0nce=$?",
         }, "; "), s)
+    end)
+
+    it("exports the run token LOOMWORKS_RUN_NONCE, never replacing a requested one", function()
+        local s = render({ argv = { "/p" }, cwd = "/", nonce = "Tok1" })
+        assert.truthy(s:find("LOOMWORKS_RUN_NONCE=Tok1 sh -c ", 1, true), s)
+        s = render({ argv = { "/p" }, cwd = "/", nonce = "Tok1", env = { LOOMWORKS_RUN_NONCE = "mine" } })
+        assert.truthy(s:find("LOOMWORKS_RUN_NONCE=mine", 1, true), s)
+        assert.is_nil(s:find("LOOMWORKS_RUN_NONCE=Tok1", 1, true), s)
     end)
 
     it("execs a program living in cwd as ./<basename> (short faultlog PNAME)", function()
@@ -187,7 +195,7 @@ describe("ohos runner exec script", function()
     it("housekeeping requests: no cwd / env / library_dirs emits no cd", function()
         local s = render({ argv = { "mkdir", "-p", "/d/x y" }, nonce = "hk1" })
         assert.equals(table.concat({
-            "sh -c 'echo __LW_PID_hk1=$$; exec \"$0\" \"$@\"' mkdir -p '/d/x y'",
+            "LOOMWORKS_RUN_NONCE=hk1 sh -c 'echo __LW_PID_hk1=$$; exec \"$0\" \"$@\"' mkdir -p '/d/x y'",
             "echo __LW_EXIT_hk1=$?",
         }, "; "), s)
         assert.equals(s, render({ argv = { "mkdir", "-p", "/d/x y" }, cwd = "", env = {},
@@ -308,10 +316,18 @@ describe("ohos runner reap (core §18.7 leftover programs)", function()
         assert.truthy(script:find("p=4242; w=" .. PROG, 1, true), script)
         assert.truthy(script:find("readlink /proc/$p/exe", 1, true), script)
         -- the identity check precedes the first signal
-        local check = script:find("elif ! x; then", 1, true)
+        local check = script:find("isp; c=$?", 1, true)
         local kill = script:find("kill $p", 1, true)
         assert.truthy(check and kill and check < kill, script)
         assert.truthy(script:find("kill -9 $p", 1, true), script)
+        -- identity: exe path, or the run token in environ + the exe base name
+        assert.truthy(script:find("v=LOOMWORKS_RUN_NONCE=n1", 1, true), script)
+        assert.truthy(script:find("b=prog", 1, true), script)
+        assert.truthy(script:find("/proc/$p/environ", 1, true), script)
+        -- the wrapper is found by the nonce in its command line; the script
+        -- never contains the literal tag itself (it would match its own shell)
+        assert.is_nil(script:find("__LW_EXIT_n1", 1, true), script)
+        assert.truthy(script:find("/proc/$1/cmdline", 1, true), script)
         assert.is_function(s.check_output)
         assert.is_function(parse)
         assert.equals("stopped", parse({ "__LW_REAP_n1=stopped\r" }))
@@ -384,6 +400,90 @@ describe("ohos runner reap (core §18.7 leftover programs)", function()
         vim.fn.system({ "sh", "-c", "kill -9 " .. pid .. "; sleep 1" })
         local verdict = run_reap({ pid = pid, nonce = "r3", program = "/x/prog" })
         assert.equals("gone", verdict)
+    end)
+
+    -- A copy of the host's `sleep` named `prog` stands in for the staged
+    -- program; `root` is its directory as the host sh sees it.
+    local function make_prog()
+        local root = vim.fn.tempname():gsub("\\", "/")
+        vim.fn.mkdir(root, "p")
+        local sh_root = root:gsub("^(%a):", function(d) return "/" .. d:lower() end)
+        vim.fn.system({ "sh", "-c", 'cp "$(command -v sleep)" "' .. sh_root .. '/prog"' })
+        return root, sh_root
+    end
+    --- Start `cmd` under sh in the background; returns its pid.
+    local function bg(cmd)
+        local out = vim.fn.systemlist({ "sh", "-c", "sh -c '" .. cmd:gsub("'", "'\\''")
+            .. "' >/dev/null 2>&1 </dev/null & echo $!" })
+        return tonumber((out[1] or ""):match("%d+"))
+    end
+    local function read_pid(file)
+        vim.wait(3000, function() return vim.fn.filereadable(file) == 1 and vim.fn.getfsize(file) > 0 end, 50)
+        local f = io.open(file, "rb")
+        local s = f and f:read("*a") or ""
+        if f then f:close() end
+        return tonumber(s:match("%d+"))
+    end
+    local function kill9(pid) vim.fn.system({ "sh", "-c", "kill -9 " .. pid .. " 2>/dev/null" }) end
+
+    it("real sh: staging gone (path no longer matches) — the run token in environ + base name identifies it", function()
+        if not sh_ok() then pending("no sh with /proc/<pid>/exe"); return end
+        local root, sh_root = make_prog()
+        -- the exec script's own env export, run by the program's launcher
+        local pid = bg("echo $$ > " .. sh_root .. "/pid; exec env LOOMWORKS_RUN_NONCE=e1 "
+            .. sh_root .. "/prog 60")
+        pid = read_pid(root .. "/pid") or pid
+        assert.is_true(alive(pid))
+        local verdict, out = run_reap({ pid = pid, nonce = "e1",
+            program = "/data/local/tmp/.device-staging/ws/u/bin/prog" })
+        assert.equals("stopped", verdict, table.concat(out, "\n"))
+        assert.is_false(alive(pid))
+        vim.fn.delete(root, "rf")
+    end)
+
+    it("real sh: same base name but another run's token (or none) is never signalled", function()
+        if not sh_ok() then pending("no sh with /proc/<pid>/exe"); return end
+        local root, sh_root = make_prog()
+        local pid = bg("echo $$ > " .. sh_root .. "/pid; exec env LOOMWORKS_RUN_NONCE=other "
+            .. sh_root .. "/prog 60")
+        pid = read_pid(root .. "/pid") or pid
+        local verdict, out = run_reap({ pid = pid, nonce = "e2",
+            program = "/data/local/tmp/.device-staging/ws/u/bin/prog" })
+        assert.equals("gone", verdict, table.concat(out, "\n"))
+        assert.is_true(alive(pid))
+        kill9(pid)
+        vim.fn.delete(root, "rf")
+    end)
+
+    it("real sh: the run's wrapper shell is stopped after its program", function()
+        if not sh_ok() then pending("no sh with /proc/<pid>/exe"); return end
+        local root, sh_root = make_prog()
+        -- a wrapper that outlives its program (as hdcd's shell did on the
+        -- device); its command line carries the run's exit tag
+        local wrapper = bg(": __LW_EXIT_w3=; sh -c 'echo $$ > " .. sh_root .. "/pid; exec env LOOMWORKS_RUN_NONCE=w3 "
+            .. sh_root .. "/prog 60'; sleep 60; true")
+        local pid = read_pid(root .. "/pid")
+        assert.is_number(pid)
+        local verdict, out = run_reap({ pid = pid, nonce = "w3", program = sh_root .. "/prog" })
+        assert.equals("stopped", verdict, table.concat(out, "\n"))
+        assert.is_false(alive(pid))
+        assert.is_false(alive(wrapper), "wrapper stopped")
+        vim.fn.delete(root, "rf")
+    end)
+
+    it("real sh: a wrapper whose program already exited is stopped; another run's wrapper is not", function()
+        if not sh_ok() then pending("no sh with /proc/<pid>/exe"); return end
+        local wrapper = bg(": __LW_EXIT_w4=; sleep 60; true")
+        local decoy = bg(": __LW_EXIT_w5=; sleep 60; true")
+        local dead = spawn_sleeper()
+        kill9(dead)
+        vim.wait(300)
+        assert.is_true(alive(wrapper))
+        local verdict, out = run_reap({ pid = dead, nonce = "w4", program = "/x/prog" })
+        assert.equals("gone", verdict, table.concat(out, "\n"))
+        assert.is_false(alive(wrapper), "wrapper stopped: " .. table.concat(out, "\n"))
+        assert.is_true(alive(decoy), "another run's wrapper untouched")
+        kill9(decoy)
     end)
 end)
 

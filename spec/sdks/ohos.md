@@ -238,7 +238,7 @@ and joined with `; ` into the single `shell` argument:
 
 ```sh
 cd '<cwd>' || { echo __LW_EXIT_<n>=126; exit 126; }
-K='V' … LD_LIBRARY_PATH='<d1>:<d2>'"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" sh -c 'echo __LW_PID_<n>=$$; exec "$0" "$@"' '<prog>' '<argv2>' …
+K='V' … LOOMWORKS_RUN_NONCE=<n> LD_LIBRARY_PATH='<d1>:<d2>'"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" sh -c 'echo __LW_PID_<n>=$$; exec "$0" "$@"' '<prog>' '<argv2>' …
 echo __LW_EXIT_<n>=$?
 ```
 
@@ -250,6 +250,11 @@ echo __LW_EXIT_<n>=$?
   exec'd by its long absolute staging path hiview published **no**
   faultlogger report; exec'd as `./<name>` from its directory it did.
   `exec "$0" "$@"` and the pid announcement are unchanged.
+- `LOOMWORKS_RUN_NONCE=<n>` is the run token (core §18.2): it reaches the
+  program's environment so `reap` (§8.9) can identify the process even when
+  its executable path is no longer resolvable. It is added to every exec
+  (housekeeping included, harmless there) and never replaces a
+  `LOOMWORKS_RUN_NONCE` the request sets itself.
 - The `cd` line is omitted when the request has no `cwd` (nil or empty);
   `env` and `library_dirs` may be absent or empty. Core's staging
   housekeeping (`mkdir -p`, `chmod 755`, `rm`, `tar -xf`, `sha256sum`)
@@ -357,35 +362,54 @@ the model code is only the last resort.
 
 ### 8.9 Reaping a leftover program (`reap`, core §18.7)
 
-A run that loses its cleanup (lw killed with `taskkill /F`, a power loss)
-leaves its program running on the device; the next run that reclaims the
-stale device lock hands `reap` the recorded `{ pid, nonce, program }`
-(`program` = the staged device-side path). The script (`M.render_reap_script`):
+A run that loses its cleanup (lw killed with `taskkill /F`, a power loss) or
+its connection leaves its program running on the device; the next
+acquisition of the device hands `reap` the recorded `{ pid, nonce, program }`
+(`program` = the staged device-side path). The script
+(`M.render_reap_script`, one line, parts joined with `; `; `@…@` filled in,
+paths single-quoted when needed):
 
 ```
-p=<pid>; w=<program>; x() { e=$(readlink /proc/$p/exe 2>/dev/null); [ "$e" = "$w" ] || [ "$e" = "$w (deleted)" ]; }
-if ! [ -d /proc/$p ]; then echo __LW_REAP_<n>=gone
-elif [ -z "$(readlink /proc/$p/exe 2>/dev/null)" ]; then echo __LW_REAP_<n>=unknown
-elif ! x; then echo __LW_REAP_<n>=gone
-else x && kill $p 2>/dev/null; sleep 1; x && kill -9 $p 2>/dev/null; sleep 1
-if x; then echo __LW_REAP_<n>=unknown; else echo __LW_REAP_<n>=stopped; fi; fi
+p=<pid>; w=<program>; b=<basename>; v=LOOMWORKS_RUN_NONCE=<n>; t=__LW_EXIT""_<n>=; me=$(readlink /proc/$$/exe 2>/dev/null)
+isp() { … }   # 0 = this run's program, 1 = another program, 2 = cannot tell
+isw() { … }   # is $1 this run's wrapper shell?
+ws=; pp=; if [ -r /proc/$p/stat ]; then read -r s < /proc/$p/stat; s=${s##*) }; set -- $s; pp=$2; isw "$pp" && ws=$pp; fi
+if [ -z "$ws" ] && ! [ -d /proc/$p ]; then for d in /proc/[0-9]*; do q=${d#/proc/}; isw "$q" && ws="$ws $q"; done; fi
+if ! [ -d /proc/$p ]; then r=gone; else isp; c=$?; if [ $c = 2 ]; then r=unknown; elif [ $c = 1 ]; then r=gone; else kill $p; sleep 1; isp && kill -9 $p; sleep 1; if isp; then r=unknown; else r=stopped; fi; fi; fi
+if [ "$r" != unknown ] && [ -n "$ws" ]; then <kill each isw wrapper>; sleep 1; <kill -9 each still-isw wrapper, echo __LW_REAP_WRAPPER_<n>=<pid>>; fi
+echo __LW_REAP_<n>=$r
 ```
 
-(one line, parts joined with `; `; `<program>` single-quoted when needed).
-
-- **Identity, not just the pid.** The exec script's inner `exec` makes the
-  announced pid the program's own, so `/proc/<pid>/exe` of a still-running
-  leftover is the staged program. A pid the device has since given to
-  another process points elsewhere: `gone`, and it is never signalled. Every
-  signal is re-guarded by the same check. `<program> (deleted)` also matches
-  (a program file replaced since).
-- A live process whose link cannot be read (another user's) cannot be
-  judged: `unknown`, nothing sent. After `kill`, a grace second, and
-  `kill -9` only if it is still the program; a process that is still the
-  program after that is `unknown`. A zombie has no readable link and counts
-  as stopped.
-- The outer shell of the exec script (which would print the exit sentinel)
-  ends on its own once the program is gone.
-- Unverified on a real device yet: that the `shell` user can read
-  `/proc/<pid>/exe` of the programs it started through hdc (it runs them as
-  the same user, so it should) and that the link is the absolute staged path.
+- **Program identity (`isp`).** Yes when `/proc/<pid>/exe` is the staged
+  path (or `<path> (deleted)`, a file replaced since), **or** when the exe's
+  base name is the program's and `/proc/<pid>/environ` holds exactly the
+  entry `LOOMWORKS_RUN_NONCE=<nonce>` (NUL-separated entries, whole-entry
+  match) — the run token the exec script exports (§8.4). Device fact
+  (Mate 60 Pro): once the staging tree is removed, the exe link of the
+  still-running program reads back as a *relative* `./<name>`, so the path
+  alone can no longer identify it. A pid the device has reused for another
+  program fails both: `gone`, never signalled. An unreadable exe link, or an
+  unreadable environ when the path does not match, is `2`: `unknown`,
+  nothing sent. Every signal is re-guarded by `isp`; a zombie has no
+  readable link and counts as stopped.
+- **The wrapper (`isw`).** hdcd runs the exec script as `sh -c <script>`;
+  that shell is the program's parent and prints the exit sentinel. Device
+  fact: after `lw device clean` reaped a program, its wrapper stayed alive
+  (blocked on its pipe to hdcd) until killed by hand. A process is this
+  run's wrapper when its exe is the same shell as the reap script's own
+  (`/proc/$$/exe`) and its `/proc/<pid>/cmdline` contains
+  `__LW_EXIT_<nonce>=` (the script text is its argument). The reap script
+  assembles that tag (`t=__LW_EXIT""_<n>=`) so its own command line never
+  matches, and skips itself (`$$`) and pid ≤ 1. The wrapper's pid is taken
+  from the program's `/proc/<pid>/stat` **before** the program is
+  signalled (device fact: once the program dies the wrapper is reparented
+  and the link is lost the other way round — killing the wrapper first
+  reparents the program to init). When the program is already gone,
+  `/proc` is scanned for the wrapper. Wrappers are signalled only after the
+  program and never after an `unknown` verdict.
+- The verdict line `__LW_REAP_<n>=stopped|gone|unknown` is what `parse`
+  reads; `__LW_REAP_WRAPPER_<n>=<pid>` lines are informational.
+- Unverified on a real device yet: `tr '\000' '\n'` and `grep -qxF` /
+  `grep -qF` on `/proc` files in the device's toybox, and reading
+  `/proc/<pid>/environ` (hdc's user is root on the test phone, so it should
+  be readable; unreadable is handled as `unknown`).
