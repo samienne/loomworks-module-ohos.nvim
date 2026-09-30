@@ -203,6 +203,11 @@ M.REAP_GRACE = 1
 
 -- The reap script (spec/sdks/ohos.md §8.9). `@P@` pid, `@W@` quoted program
 -- path, `@B@` quoted base name, `@N@` nonce, `@G@` grace seconds. One line.
+-- Only the device toolset of §8.10 (the phone's toybox has no `tr`/`awk`,
+-- and its grep stops at the first NUL): NUL-separated /proc files are read
+-- through `z` (`xargs -0 -n1`, else `strings`), never by grep directly;
+-- stat fields come from the builtin `read`.
+--   z:   one entry per line of a NUL-separated /proc file.
 --   isp: is process $p this run's program? 0 yes / 1 another program /
 --        2 cannot tell. Yes when its exe is the staged path (or that path
 --        "(deleted)"), or when its exe base name is the program's AND its
@@ -212,11 +217,12 @@ M.REAP_GRACE = 1
 --        so this script's own command line never matches it).
 local REAP_SCRIPT = table.concat({
     [[p=@P@; w=@W@; b=@B@; v=LOOMWORKS_RUN_NONCE=@N@; t=__LW_EXIT""_@N@=; me=$(readlink /proc/$$/exe 2>/dev/null)]],
-    [[isp() { e=$(readlink /proc/$p/exe 2>/dev/null); [ -n "$e" ] || return 2; if [ "$e" = "$w" ] || [ "$e" = "$w (deleted)" ]; then return 0; fi; n=${e%" (deleted)"}; [ "${n##*/}" = "$b" ] || return 1; en=$(tr '\000' '\n' < /proc/$p/environ 2>/dev/null) || return 2; if printf '%s\n' "$en" | grep -qxF -- "$v"; then return 0; fi; return 1; }]],
-    [[isw() { [ -n "$1" ] && [ "$1" != "$$" ] && [ "$1" -gt 1 ] 2>/dev/null && [ -n "$me" ] && [ "$(readlink /proc/$1/exe 2>/dev/null)" = "$me" ] && grep -qF -- "$t" /proc/$1/cmdline 2>/dev/null; }]],
-    [[ws=; pp=; if [ -r /proc/$p/stat ]; then read -r s < /proc/$p/stat; s=${s##*) }; set -- $s; pp=$2; isw "$pp" && ws=$pp; fi]],
-    [[if [ -z "$ws" ] && ! [ -d /proc/$p ]; then for d in /proc/[0-9]*; do q=${d#/proc/}; isw "$q" && ws="$ws $q"; done; fi]],
+    [[z() { xargs -0 -n1 < "$1" 2>/dev/null || strings "$1" 2>/dev/null; }]],
+    [[isp() { e=$(readlink /proc/$p/exe 2>/dev/null); [ -n "$e" ] || return 2; if [ "$e" = "$w" ] || [ "$e" = "$w (deleted)" ]; then return 0; fi; n=${e%" (deleted)"}; [ "${n##*/}" = "$b" ] || return 1; en=$(z /proc/$p/environ) || return 2; if echo "$en" | grep -qxF -- "$v"; then return 0; fi; return 1; }]],
+    [[isw() { [ -n "$1" ] && [ "$1" != "$$" ] && [ "$1" -gt 1 ] 2>/dev/null && [ -n "$me" ] && [ "$(readlink /proc/$1/exe 2>/dev/null)" = "$me" ] && z /proc/$1/cmdline | grep -qF -- "$t"; }]],
+    [[ws=; pp=; if [ -r /proc/$p/stat ]; then read -r s1 s2 s3 pp rest < /proc/$p/stat; isw "$pp" && ws=$pp; fi]],
     [[if ! [ -d /proc/$p ]; then r=gone; else isp; c=$?; if [ $c = 2 ]; then r=unknown; elif [ $c = 1 ]; then r=gone; else kill $p 2>/dev/null; sleep @G@; isp && kill -9 $p 2>/dev/null; sleep @G@; if isp; then r=unknown; else r=stopped; fi; fi; fi]],
+    [[if [ -z "$ws" ] && [ "$r" != unknown ]; then read -r m1 mc m2 < /proc/$$/stat; for d in /proc/[0-9]*; do read -r q qc q2 < $d/stat 2>/dev/null || continue; [ "$qc" = "$mc" ] || continue; isw "$q" && ws="$ws $q"; done; fi]],
     [[if [ "$r" != unknown ] && [ -n "$ws" ]; then for q in $ws; do isw "$q" && kill $q 2>/dev/null; done; sleep @G@; for q in $ws; do isw "$q" && kill -9 $q 2>/dev/null && echo __LW_REAP_WRAPPER_@N@=$q; done; fi]],
     [[echo __LW_REAP_@N@=$r]],
 }, "; ")

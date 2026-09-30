@@ -367,49 +367,78 @@ its connection leaves its program running on the device; the next
 acquisition of the device hands `reap` the recorded `{ pid, nonce, program }`
 (`program` = the staged device-side path). The script
 (`M.render_reap_script`, one line, parts joined with `; `; `@…@` filled in,
-paths single-quoted when needed):
+paths single-quoted when needed) uses only the toolset of §8.10:
 
 ```
 p=<pid>; w=<program>; b=<basename>; v=LOOMWORKS_RUN_NONCE=<n>; t=__LW_EXIT""_<n>=; me=$(readlink /proc/$$/exe 2>/dev/null)
+z() { xargs -0 -n1 < "$1" 2>/dev/null || strings "$1" 2>/dev/null; }   # a NUL-separated /proc file, one entry per line
 isp() { … }   # 0 = this run's program, 1 = another program, 2 = cannot tell
 isw() { … }   # is $1 this run's wrapper shell?
-ws=; pp=; if [ -r /proc/$p/stat ]; then read -r s < /proc/$p/stat; s=${s##*) }; set -- $s; pp=$2; isw "$pp" && ws=$pp; fi
-if [ -z "$ws" ] && ! [ -d /proc/$p ]; then for d in /proc/[0-9]*; do q=${d#/proc/}; isw "$q" && ws="$ws $q"; done; fi
+ws=; pp=; if [ -r /proc/$p/stat ]; then read -r s1 s2 s3 pp rest < /proc/$p/stat; isw "$pp" && ws=$pp; fi
 if ! [ -d /proc/$p ]; then r=gone; else isp; c=$?; if [ $c = 2 ]; then r=unknown; elif [ $c = 1 ]; then r=gone; else kill $p; sleep 1; isp && kill -9 $p; sleep 1; if isp; then r=unknown; else r=stopped; fi; fi; fi
+if [ -z "$ws" ] && [ "$r" != unknown ]; then <scan /proc/[0-9]*: shells with this shell's comm (builtin read of stat), isw each>; fi
 if [ "$r" != unknown ] && [ -n "$ws" ]; then <kill each isw wrapper>; sleep 1; <kill -9 each still-isw wrapper, echo __LW_REAP_WRAPPER_<n>=<pid>>; fi
 echo __LW_REAP_<n>=$r
 ```
 
+- **Reading NUL-separated `/proc` files (`z`).** `environ` and `cmdline`
+  are read only as `xargs -0 -n1 < file` (one entry per line), falling back
+  to `strings file`. Device fact (toybox 0.8.12, Mate 60 Pro): there is no
+  `tr` and no `awk`; `grep` stops at the first NUL of an input (also through
+  `cat |`), and `sed 's/\x0/\n/g'` does not split — so `grep` never reads a
+  `/proc` file directly. `strings` drops entries shorter than 4 characters,
+  which never matters for the run token or the exit tag.
 - **Program identity (`isp`).** Yes when `/proc/<pid>/exe` is the staged
-  path (or `<path> (deleted)`, a file replaced since), **or** when the exe's
-  base name is the program's and `/proc/<pid>/environ` holds exactly the
-  entry `LOOMWORKS_RUN_NONCE=<nonce>` (NUL-separated entries, whole-entry
-  match) — the run token the exec script exports (§8.4). Device fact
-  (Mate 60 Pro): once the staging tree is removed, the exe link of the
-  still-running program reads back as a *relative* `./<name>`, so the path
-  alone can no longer identify it. A pid the device has reused for another
-  program fails both: `gone`, never signalled. An unreadable exe link, or an
-  unreadable environ when the path does not match, is `2`: `unknown`,
-  nothing sent. Every signal is re-guarded by `isp`; a zombie has no
-  readable link and counts as stopped.
+  path (or `<path> (deleted)`), **or** when the exe's base name is the
+  program's and the environ entries (`z`) hold exactly
+  `LOOMWORKS_RUN_NONCE=<nonce>` (`grep -qxF`, whole line) — the run token
+  the exec script exports (§8.4). Device fact: once the staging tree is
+  removed, the exe link of the still-running program reads back as a
+  *relative* `./<name>` (not `(deleted)`), so the path alone can no longer
+  identify it. A pid the device has reused for another program fails both:
+  `gone`, never signalled. An unreadable exe link, or an unreadable environ
+  when the path does not match, is `2`: `unknown`, nothing sent. Every
+  signal is re-guarded by `isp`; a zombie has no readable link and counts
+  as stopped.
 - **The wrapper (`isw`).** hdcd runs the exec script as `sh -c <script>`;
   that shell is the program's parent and prints the exit sentinel. Device
-  fact: after `lw device clean` reaped a program, its wrapper stayed alive
-  (blocked on its pipe to hdcd) until killed by hand. A process is this
-  run's wrapper when its exe is the same shell as the reap script's own
-  (`/proc/$$/exe`) and its `/proc/<pid>/cmdline` contains
-  `__LW_EXIT_<nonce>=` (the script text is its argument). The reap script
-  assembles that tag (`t=__LW_EXIT""_<n>=`) so its own command line never
-  matches, and skips itself (`$$`) and pid ≤ 1. The wrapper's pid is taken
-  from the program's `/proc/<pid>/stat` **before** the program is
-  signalled (device fact: once the program dies the wrapper is reparented
-  and the link is lost the other way round — killing the wrapper first
-  reparents the program to init). When the program is already gone,
-  `/proc` is scanned for the wrapper. Wrappers are signalled only after the
-  program and never after an `unknown` verdict.
+  facts: a wrapper can outlive its program, blocked on its pipe to hdcd
+  (wchan `hm_futex_wait_interruptible`), in both the next-run and the
+  `lw device clean` paths. A process is this run's wrapper when its exe is
+  the same shell as the reap script's own (`/proc/$$/exe`) and its
+  command-line entries (`z /proc/<pid>/cmdline`) contain
+  `__LW_EXIT_<nonce>=` (`grep -qF`). The reap script assembles that tag
+  (`t=__LW_EXIT""_<n>=`) so its own command line never matches, and skips
+  itself (`$$`) and pid ≤ 1. The wrapper's pid is the program's ppid, read
+  from `/proc/<pid>/stat` with the shell builtin `read -r s1 s2 s3 pp rest`
+  **before** the program is signalled (killing the wrapper first reparents
+  the program to init). When that does not yield it (the program is gone,
+  or was already reparented), `/proc` is scanned; the scan reads each
+  `stat` with the builtin `read` and checks only processes whose command
+  name equals this shell's, so it costs almost no spawned processes.
+  Wrappers are signalled only after the program and never after an
+  `unknown` verdict.
 - The verdict line `__LW_REAP_<n>=stopped|gone|unknown` is what `parse`
   reads; `__LW_REAP_WRAPPER_<n>=<pid>` lines are informational.
-- Unverified on a real device yet: `tr '\000' '\n'` and `grep -qxF` /
-  `grep -qF` on `/proc` files in the device's toybox, and reading
-  `/proc/<pid>/environ` (hdc's user is root on the test phone, so it should
-  be readable; unreadable is handled as `unknown`).
+- Beta.3 on the phone (v0.1.3, which used `tr` and `grep` on `/proc`
+  files): identity by run token answered `unknown` and the next-run path
+  never found the wrapper (its cmdline check could not match). That the
+  wrapper was gone after `lw device clean` there was therefore not reap's
+  doing; the wrapper apparently ended on its own in that run.
+
+### 8.10 Device toolset
+
+The exec script (§8.4) and the reap script (§8.9) use only shell builtins
+(`echo`, `read`, `kill`, `[`, `set`, `case`, functions, `$(…)`,
+`${var%…}` / `${var##…}`, globs) and these tools, all proven present and
+working on the phone's toybox 0.8.12: `cut`, `grep` (`-q`, `-x`, `-F`;
+never on a NUL-separated input), `od`, `readlink`, `sleep` (fractions),
+`strings`, `timeout`, `xargs` (`-0 -n1`), `sh`, `kill`, `ls`, `cat`.
+Absent there: `tr`, `awk`; not usable: `sed` on NUL bytes.
+
+`tests/ohos_reap_toybox_spec.lua` runs both scripts under the host's
+POSIX sh with `PATH` restricted to shims for exactly this set — no `tr`,
+no `awk` — where the `grep` shim stops every input at its first NUL like
+toybox's, and `strings` is emulated; a second variant also drops `xargs`
+to exercise the `strings` fallback. A script change that relies on
+anything else fails there, not on the phone.

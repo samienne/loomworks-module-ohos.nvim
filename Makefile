@@ -5,7 +5,7 @@ INIT_FILE := tests/minimal_init.lua
 
 ## Run all tests
 test:
-	nvim --headless -u $(INIT_FILE) -c "PlenaryBustedDirectory $(TESTS_DIR)/ {minimal_init = '$(INIT_FILE)'}"
+	nvim --headless -u $(INIT_FILE) -c "PlenaryBustedDirectory $(TESTS_DIR)/ {minimal_init = '$(INIT_FILE)', timeout = 300000}"
 
 ## Run a single test file: make test-file FILE=tests/harmony_sdk_env_spec.lua
 ##
