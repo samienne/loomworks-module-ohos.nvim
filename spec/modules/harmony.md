@@ -145,7 +145,7 @@ HarmonyOS device connector.
 | Method | Command shape |
 |--------|---------------|
 | `list_devices` | `hdc list targets -v` (via the ohos device runner, below) |
-| `device_install` | `hdc -t <serial> install <artifact>` |
+| `device_install` | `hdc -t <serial> install <artifact>` (an unsigned HAP is refused first, §6.4) |
 | `device_launch` | `hdc -t <serial> shell aa start -a <ability> -b <bundle>` |
 | `device_stop` | `hdc -t <serial> shell aa force-stop -b <bundle>` |
 | `device_pid` | `hdc -t <serial> shell pidof <bundle>` |
@@ -263,6 +263,21 @@ Returned as a table passed to `device_launch()` as `launch_info`.
 
 Locates the built HAP file within the hvigor output tree based on
 the active product/target/mode.
+
+A signed build leaves both `<module>-<product>-signed.hap` and
+`<module>-<product>-unsigned.hap` there; the newest HAP that is not
+`-unsigned.hap` wins, and an unsigned one is returned only when no other
+exists.
+
+**Unsigned HAP.** When the project's `build-profile.json5` has no
+`signingConfigs` (`"signingConfigs": []`), hvigor logs `Will skip sign
+'hos_hap'. No signingConfigs` and produces only `*-unsigned.hap`, which
+the phone rejects (`code:9568320 error: no signature file.`).
+`device_install` checks the artifact name (not the json5) and refuses it
+before installing: its command is a local `hdc version` (no device
+contact) whose `check_output` fails with
+
+> `the HAP is unsigned: <project>/build-profile.json5 has no signingConfigs — sign it in DevEco Studio (File > Project Structure > Signing Configs, automatic signing) and rebuild`
 
 ### 6.5 hilog: records, filters, log options
 
