@@ -950,6 +950,24 @@ end
 --- module use one detector (spec/modules/harmony.md §6.2).
 local check_hdc_output = hdc.check_output
 
+--- The error for installing an unsigned HAP, or nil when it is signed.
+--- hvigor names its output `<module>-<product>-unsigned.hap` when the
+--- project's build-profile.json5 has no signingConfigs; the artifact
+--- name is checked rather than parsing the json5.
+--- @param artifact_path string
+--- @return string|nil
+function M.unsigned_hap_error(artifact_path)
+    local p = (artifact_path or ""):gsub("\\", "/")
+    if not p:match("%-unsigned%.hap$") then return nil end
+    -- <project>/<module>/build/<product>/outputs/<target>/<name>.hap
+    local project = p:match("^(.*)/[^/]+/build/[^/]+/outputs/[^/]+/[^/]+$")
+    local profile = project and (project .. "/build-profile.json5")
+        or "the project's build-profile.json5"
+    return "the HAP is unsigned: " .. profile .. " has no signingConfigs"
+        .. " — sign it in DevEco Studio (File > Project Structure > Signing"
+        .. " Configs, automatic signing) and rebuild"
+end
+
 --- Return command spec for installing a HAP on a device.
 --- Normalizes path separators: hdc on Windows requires backslashes and
 --- treats forward-slash paths as relative, producing doubled paths.
@@ -959,6 +977,19 @@ local check_hdc_output = hdc.check_output
 --- @param artifact_path string absolute path to HAP file
 --- @return { cmd: string, args: string[], check_output: function }
 function M.device_install(tool_data, device_serial, artifact_path)
+    -- An unsigned HAP (hvigor: "Will skip sign 'hos_hap'. No
+    -- signingConfigs") is only rejected by the phone ("code:9568320
+    -- error: no signature file."). Refuse it before installing: run a
+    -- local `hdc version` (no device contact) whose check_output always
+    -- fails with the actionable message (spec/modules/harmony.md §6.4).
+    local unsigned_err = M.unsigned_hap_error(artifact_path)
+    if unsigned_err then
+        return {
+            cmd = tool_data.hdc,
+            args = { "version" },
+            check_output = function() return unsigned_err end,
+        }
+    end
     local path = artifact_path
     if is_win then path = path:gsub("/", "\\") end
     return {
@@ -1176,18 +1207,23 @@ function M.resolve_artifact(project_ctx, active_config)
     local stat = uv.fs_stat(output_dir)
     if not stat then return nil end
 
-    local best_path, best_mtime = nil, 0
+    -- A signed build leaves both `-signed.hap` and `-unsigned.hap`; an
+    -- unsigned HAP is chosen only when no other is there (device_install
+    -- then refuses it, §6.4).
+    local best_path, best_mtime, best_unsigned = nil, -1, true
     local handle = uv.fs_scandir(output_dir)
     if handle then
         while true do
-            local name, type = uv.fs_scandir_next(handle)
+            local name = uv.fs_scandir_next(handle)
             if not name then break end
             if name:match("%.hap$") then
                 local full = output_dir .. "/" .. name
                 local s = uv.fs_stat(full)
-                if s and s.mtime and s.mtime.sec > best_mtime then
-                    best_mtime = s.mtime.sec
-                    best_path = full
+                local mtime = s and s.mtime and s.mtime.sec or 0
+                local unsigned = name:match("%-unsigned%.hap$") ~= nil
+                if s and ((best_unsigned and not unsigned)
+                    or (unsigned == best_unsigned and mtime > best_mtime)) then
+                    best_mtime, best_unsigned, best_path = mtime, unsigned, full
                 end
             end
         end
